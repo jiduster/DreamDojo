@@ -693,8 +693,8 @@ def _video_vae(
         model,
         torch.zeros(1, 1, 1, 1, 1, device=device),
         torch.ones(1, 1, 1, 1, 1, device=device),
-        torch.zeros(1, 1, 50, 1, 1, device=device),
-        torch.ones(1, 1, 50, 1, 1, device=device),
+        torch.zeros(1, 1, 500, 1, 1, device=device),
+        torch.ones(1, 1, 500, 1, 1, device=device),
     )
 
 
@@ -1001,9 +1001,13 @@ class Wan2pt1VAEInterface(VideoTokenizerInterface):
         if num_frames == 1:
             return (latents - self.model.img_mean.type_as(latents)) / self.model.img_std.type_as(latents)
         else:
-            return (latents - self.model.video_mean[:, :, :num_frames].type_as(latents)) / self.model.video_std[
-                :, :, :num_frames
-            ].type_as(latents)
+            if latents.shape[2] > self.model.video_mean.shape[2] or latents.shape[2] > self.model.video_std.shape[2]:
+                # Attempting a hack to extend mean and std
+                assert torch.all(self.model.video_mean == self.model.video_mean.flatten()[0])
+                assert torch.all(self.model.video_std == self.model.video_std.flatten()[0])
+                self.model.video_mean = self.model.video_mean[:, :, 0:1, :, :]
+                self.model.video_std = self.model.video_std[:, :, 0:1, :, :]
+            return (latents - self.model.video_mean[:, :, :num_frames].type_as(latents)) / self.model.video_std[:, :, :num_frames].type_as(latents)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         num_frames = latent.shape[2]

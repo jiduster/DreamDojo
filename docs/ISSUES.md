@@ -1,4 +1,4 @@
-# Trouble Shooting
+# Troubleshooting
 
 We will continue to improve this repository. If you encounter any issues, please feel free to let us know!
 

@@ -31,8 +31,6 @@ from cosmos_predict2._src.predict2.datasets.dataset_provider import get_image_da
 from cosmos_predict2._src.predict2.datasets.joint_dataloader import IterativeJointDataLoader
 from cosmos_predict2._src.predict2.models.video2world_model import HighSigmaStrategy
 from cosmos_predict2._src.predict2.text_encoders.text_encoder import EmbeddingConcatStrategy
-
-# pyrefly: ignore [missing-import]
 from cosmos_predict2.config import MODEL_CHECKPOINTS, ModelKey
 
 DEFAULT_CHECKPOINT = MODEL_CHECKPOINTS[ModelKey()]  # This uses post_trained=True by default
@@ -630,8 +628,8 @@ AC_CHUNK_MULTI_VIEW_2B_GR00T_GR1_CUSTOMIZED_13FRAME = LazyDict(
         defaults=[
             "/experiment/cosmos_predict2p1_2B_reason_embeddings_action_conditioned_rectified_flow_bridge_13frame_480_640_",
             {"override /net": "cosmos_v1_2B_action_chunk_conditioned"},
-            {"override /data_train": "gr00t_customiezed_gr1_train"},
-            {"override /data_val": "gr00t_customiezed_gr1_val"},
+            {"override /data_train": "gr00t_customized_gr1"},
+            {"override /data_val": "gr00t_customized_gr1"},
         ],
         job=dict(
             group="official_runs_vid2vid",
@@ -798,8 +796,8 @@ AC_CHUNK_MULTI_VIEW_2B_GR00T_GR1_CUSTOMIZED_13FRAME_FULL_16NODES_OSS = LazyDict(
         defaults=[
             "/experiment/2b_bridge_action_conditioned_oss",
             {"override /net": "cosmos_v1_2B_action_chunk_conditioned"},
-            {"override /data_train": "gr00t_customiezed_gr1_train"},
-            {"override /data_val": "gr00t_customiezed_gr1_val"},
+            {"override /data_train": "gr00t_customized_gr1"},
+            {"override /data_val": "gr00t_customized_gr1"},
             "_self_",
         ],
         job=dict(

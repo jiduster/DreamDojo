@@ -69,6 +69,7 @@ class DTensorFastEmaModelUpdater:
         self.is_cached = False
 
 
+@torch.no_grad()
 def broadcast_dtensor_model_states(model: torch.nn.Module, mesh: DeviceMesh):
     """Broadcast model states from replicate mesh's rank 0."""
     replicate_group = mesh.get_group("replicate")
@@ -81,8 +82,21 @@ def broadcast_dtensor_model_states(model: torch.nn.Module, mesh: DeviceMesh):
         src_rank = all_ranks[0]
         # Broadcast the local tensor
         local_tensor = get_local_tensor_if_DTensor(tensor)
+
+        # Handle CPU tensors by moving to CUDA for broadcast
+        # This is needed because the replicate_group (NCCL) doesn't support CPU tensors
+        is_cpu = local_tensor.device.type == "cpu"
+        if is_cpu:
+            start_device = local_tensor.device
+            tensor_to_broadcast = local_tensor.cuda()
+        else:
+            tensor_to_broadcast = local_tensor
+
         dist.broadcast(
-            local_tensor,
+            tensor_to_broadcast,
             src=src_rank,
             group=replicate_group,
         )
+
+        if is_cpu:
+            local_tensor.copy_(tensor_to_broadcast.to(start_device))

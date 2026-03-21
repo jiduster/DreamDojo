@@ -1,6 +1,8 @@
 import torch
 import random
 import numpy as np
+from pathlib import Path
+import yaml
 
 from groot_dreams.data.dataset import WrappedLeRobotSingleDataset
 from groot_dreams.groot_configs import construct_modality_config_and_transforms
@@ -95,6 +97,8 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
         deterministic_uniform_sampling=False,
         dataset_mixing_weights=None,
         restrict_len=None,
+
+        cr1_embeddings_path=None,
     ):
         if args is not None:
             dataset_path = args.dataset_path
@@ -174,6 +178,10 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
             self.dataset_mixing_weights = [float(w) for w in self.dataset_mixing_weights]
             total_prob = sum(self.dataset_mixing_weights)
             self.sample_probs = [x / total_prob for x in self.dataset_mixing_weights]
+        self.t5_text_embeddings, self.t5_text_mask = None, None
+        if cr1_embeddings_path is not None:
+            self.t5_text_embeddings = torch.load(cr1_embeddings_path, map_location="cpu")[0]
+            self.t5_text_mask = torch.ones(self.t5_text_embeddings.shape[0])
     
     def __getitem__(self, data_id):
         if self.deterministic_uniform_sampling:
@@ -183,6 +191,7 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
                 min_len = self.restrict_len / len(self.datasets)
             dataset = self.datasets[int(data_id / min_len)]
             data_id = int((data_id % min_len) / min_len * len(dataset))
+            ret = dataset[data_id]
         elif self.dataset_mixing_weights is not None:
             # # Stochastic dataset sampling with per-dataset item iteration (loosely based on tf.data.Dataset.sample_from_datasets)
             # dataset_idx = int(np.random.choice(len(self.datasets), p=self.dataset_mixing_weights))
@@ -194,7 +203,7 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
             #     self.dataset_shuffle_indexes[dataset_idx] = torch.randperm(len(dataset)).tolist()
             subset = random.choices(self.datasets, self.sample_probs)[0]
             sample_idx = random.randint(0, len(subset) - 1)
-            return subset[sample_idx]
+            ret = subset[sample_idx]
         else:
             if self.restrict_len is not None:
                 full_len = sum([len(d) for d in self.datasets])
@@ -203,7 +212,11 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
                 if data_id < len(dataset):
                     break
                 data_id -= len(dataset)
-        return dataset[data_id]
+            ret = dataset[data_id]
+        if self.t5_text_embeddings is not None and self.t5_text_mask is not None:
+            ret["t5_text_embeddings"] = self.t5_text_embeddings
+            ret["t5_text_mask"] = self.t5_text_mask
+        return ret
     
     def __len__(self):
         if self.restrict_len:
@@ -212,3 +225,20 @@ class MultiVideoActionDataset(torch.utils.data.Dataset):
             return min([len(d) for d in self.datasets]) * len(self.datasets)
         else:
             return sum([len(d) for d in self.datasets])
+
+
+def get_data_path(embodiment):
+    yaml_path = Path(__file__).parent.parent / "configs" / f"2b_480_640_{embodiment}.yaml"
+    if not yaml_path.exists():
+        if embodiment == "agibot_fruit":
+            return "datasets/agibot_fruit", None
+        else:
+            raise ValueError(f"Unknown embodiment: {embodiment}")
+    
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+    dataset_path = config["dataloader_train"]["dataset"]["dataset_path"]
+    dataset_mixing_weights = None
+    if "dataset_mixing_weights" in config["dataloader_train"]["dataset"]:
+        dataset_mixing_weights = config["dataloader_train"]["dataset"]["dataset_mixing_weights"]
+    return dataset_path, dataset_mixing_weights

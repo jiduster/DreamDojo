@@ -168,7 +168,7 @@ class FusedAdam(torch.optim.Optimizer):
                         if isinstance(group["step"], torch.Tensor)
                         else torch.tensor(group["step"], dtype=torch.int32, device=device)
                     )
-                    group["step"] += (self._dummy_overflow_buf != 1).to(torch.int)
+                    group["step"] += (self._dummy_overflow_buf != 1).to(dtype=torch.int, device=device)
                 else:
                     group["step"] += 1
             else:
@@ -188,6 +188,10 @@ class FusedAdam(torch.optim.Optimizer):
             p_16_master = []
             p_32_master = []
             bf16_master = []
+            
+            # cpu lists
+            g_cpu, p_cpu, m_cpu, v_cpu = [], [], [], []
+            p_cpu_master = []
 
             for p, p_master in zip(group["params"], group_master["params"]):
                 if p.grad is None:
@@ -207,7 +211,16 @@ class FusedAdam(torch.optim.Optimizer):
                     # Change that makes .step() not crash
                     state["exp_avg_sq"] = torch.zeros_like(get_local_tensor_if_DTensor(p).data).float()
 
-                if p.dtype == torch.float16:
+                
+                # Check for CPU device
+                if p.device.type == "cpu":
+                     if self.master_weights:
+                        p_cpu_master.append(get_local_tensor_if_DTensor(p_master).data)
+                     g_cpu.append(get_local_tensor_if_DTensor(p.grad).data.float())
+                     p_cpu.append(get_local_tensor_if_DTensor(p).data)
+                     m_cpu.append(state["exp_avg"])
+                     v_cpu.append(state["exp_avg_sq"])
+                elif p.dtype == torch.float16:
                     if self.master_weights:
                         p_16_master.append(get_local_tensor_if_DTensor(p_master).data)
                     g_16.append(get_local_tensor_if_DTensor(p.grad))
@@ -358,6 +371,55 @@ class FusedAdam(torch.optim.Optimizer):
                         bias_correction,
                         group["weight_decay"],
                     )
+
+            # Fallback for CPU parameters using standard AdamW
+            if len(g_cpu) > 0:
+                # Handle scaler logic manually for CPU
+                if grad_scaler is not None:
+                    # Check for overflow (sync)
+                    if self._dummy_overflow_buf.item() == 1:
+                        # Found Inf, skip update for CPU params
+                        # We must still return loss if applicable, but skip optimization
+                        # CPU parameters are not updated.
+                        return loss
+
+                    # Unscale gradients (sync scale)
+                    scale = grad_scaler._get_scale_async()
+                    inv_scale_val = 1.0 / scale.item()
+                    for g in g_cpu:
+                        g.mul_(inv_scale_val)
+
+                # If master weights are used, update them; else update params directly
+                params_to_update = p_cpu_master if self.master_weights and len(p_cpu_master) > 0 else p_cpu
+                
+                # Create step tensors on CPU
+                steps = [
+                    torch.tensor(group["step"], device="cpu", dtype=torch.float32) 
+                    for _ in params_to_update
+                ]
+
+                torch.optim._functional.adamw(
+                    params=params_to_update,
+                    grads=g_cpu,
+                    exp_avgs=m_cpu,
+                    exp_avg_sqs=v_cpu,
+                    max_exp_avg_sqs=[],
+                    state_steps=steps,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"] if not isinstance(group["lr"], torch.Tensor) else group["lr"].item(),
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                    grad_scale=None,
+                    found_inf=None,
+                )
+
+                # Sync back master weights to model weights if necessary
+                if self.master_weights and len(p_cpu_master) > 0:
+                    for p, p_m in zip(p_cpu, p_cpu_master):
+                        p.copy_(p_m)
 
         return loss
 

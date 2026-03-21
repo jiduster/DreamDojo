@@ -316,11 +316,14 @@ class DistillationCoreMixin:
 
         _new_state_dict = collections.OrderedDict()
         for k in _state_dict.keys():
-            # if "_extra_state" in k:
+            if "_extra_state" in k:
+                continue
             #     log.warning(k)
             _new_state_dict[f"{prefix}.{k}"] = _state_dict[k]
         dcp.load(_new_state_dict, storage_reader=storage_reader, planner=DefaultLoadPlanner(allow_partial_load=True))
         for k in _state_dict.keys():
+            if "_extra_state" in k:
+                continue
             _state_dict[k] = _new_state_dict[f"{prefix}.{k}"]
 
         log.info(set_model_state_dict(net, _state_dict, options=StateDictOptions(strict=False)))
@@ -369,15 +372,15 @@ class DistillationCoreMixin:
         if hasattr(self.tokenizer, "reset_dtype"):
             self.tokenizer.reset_dtype()
 
-        self.net = self.net.to(memory_format=memory_format, **self.tensor_kwargs)
-        self.net_teacher = self.net_teacher.to(memory_format=memory_format, **self.tensor_kwargs)
-
+        tensor_kwargs = {k: v for k, v in self.tensor_kwargs.items() if k != "device"}
+        self.net = self.net.to(memory_format=memory_format, **tensor_kwargs)
+        self.net_teacher = self.net_teacher.to(memory_format=memory_format, **tensor_kwargs)
         if self.net_fake_score:
-            self.net_fake_score = self.net_fake_score.to(memory_format=memory_format, **self.tensor_kwargs)
+            self.net_fake_score = self.net_fake_score.to(memory_format=memory_format, **tensor_kwargs)
 
         if self.net_discriminator_head:
             self.net_discriminator_head = self.net_discriminator_head.to(
-                memory_format=memory_format, **self.tensor_kwargs
+                memory_format=memory_format, **tensor_kwargs
             )
 
         if hasattr(self.config, "use_torch_compile") and self.config.use_torch_compile:  # compatible with old config
@@ -668,7 +671,8 @@ class DistillationCoreMixin:
         else:
             log.info(f"==================Critic phase. iteration: {iteration}")
             # update the fake_score and discriminator
-            self.net.eval().requires_grad_(False)
+            # self.net.eval().requires_grad_(False)
+            self.net.eval()  # Need to disable this for FSDP + gradient checkpointing
             if self.net_fake_score:
                 self.net_fake_score.train().requires_grad_(True)
                 if self.net_fake_score.use_crossattn_projection and self.disable_proj_grad:

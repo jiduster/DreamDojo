@@ -26,13 +26,6 @@
 - **[2026/02/18]** We released the GR-1 post-training datasets and the evaluation sets.
 - **[2026/02/09]** We released our [paper](https://arxiv.org/abs/2602.06949) on arXiv.
 
-## 📋 Release Plan
-
-We aim to release the following items this month.
-
-- [ ] Distillation pipeline.
-- [ ] Teleoperation code.
-
 ## 🕹️ Quick Start
 
 - [Setup](https://github.com/NVIDIA/DreamDojo/blob/main/docs/SETUP.md)

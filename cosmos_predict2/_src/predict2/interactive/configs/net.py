@@ -14,10 +14,11 @@
 # limitations under the License.
 
 
+import copy
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
-from cosmos_predict2._src.predict2.action.configs.action_conditioned.net import COSMOS_V1_2B_NET_MININET_ACTION_CHUNK
+from cosmos_predict2._src.predict2.action.configs.action_conditioned.net import COSMOS_V1_2B_NET_MININET_ACTION_CHUNK, COSMOS_V1_14B_NET_MININET_ACTION_CHUNK
 from cosmos_predict2._src.predict2.interactive.networks.dit_action_causal import ActionChunkCausalDITwithConditionalMask
 from cosmos_predict2._src.predict2.interactive.networks.dit_causal import CausalDITwithConditionalMask
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import SACConfig
@@ -51,15 +52,32 @@ BASE_NET_KWARGS = dict(
     crossattn_emb_channels=1024,
 )
 
+BASE_NET_KWARGS_14B = copy.deepcopy(BASE_NET_KWARGS)
+BASE_NET_KWARGS_14B["model_channels"] = 5120
+BASE_NET_KWARGS_14B["num_heads"] = 40
+BASE_NET_KWARGS_14B["num_blocks"] = 36
+BASE_NET_KWARGS_14B["extra_per_block_abs_pos_emb"] = False
+BASE_NET_KWARGS_14B["rope_t_extrapolation_ratio"] = 1.0
+
 # Causal DiT
 CAUSAL_DIT_V1_2B = L(CausalDITwithConditionalMask)(
     **BASE_NET_KWARGS,
     atten_backend="i4",
 )
 
+CAUSAL_DIT_V1_14B = L(CausalDITwithConditionalMask)(
+    **BASE_NET_KWARGS_14B,
+    atten_backend="i4",
+)
+
 # Causal DiT
 ACTION_CAUSAL_DIT_COSMOS_V1_2B = L(ActionChunkCausalDITwithConditionalMask)(
     **BASE_NET_KWARGS,
+    atten_backend="i4",
+)
+
+ACTION_CAUSAL_DIT_COSMOS_V1_14B = L(ActionChunkCausalDITwithConditionalMask)(
+    **BASE_NET_KWARGS_14B,
     atten_backend="i4",
 )
 
@@ -77,8 +95,20 @@ def register_net():
         cs.store(
             group=net_group,
             package=f"model.config.{net_group}",
+            name="causal_cosmos_v1_14B",
+            node=CAUSAL_DIT_V1_14B,
+        )
+        cs.store(
+            group=net_group,
+            package=f"model.config.{net_group}",
             name="action_causal_cosmos_v1_2B",
             node=ACTION_CAUSAL_DIT_COSMOS_V1_2B,
+        )
+        cs.store(
+            group=net_group,
+            package=f"model.config.{net_group}",
+            name="action_causal_cosmos_v1_14B",
+            node=ACTION_CAUSAL_DIT_COSMOS_V1_14B,
         )
 
 
@@ -90,6 +120,12 @@ def register_net_fake_score():
         name="cosmos_v1_2B_action_chunk_conditioned",
         node=COSMOS_V1_2B_NET_MININET_ACTION_CHUNK,
     )
+    cs.store(
+        group="net_fake_score",
+        package="model.config.net_fake_score",
+        name="cosmos_v1_14B_action_chunk_conditioned",
+        node=COSMOS_V1_14B_NET_MININET_ACTION_CHUNK,
+    )
 
 
 def register_net_teacher():
@@ -99,4 +135,10 @@ def register_net_teacher():
         package="model.config.net_teacher",
         name="cosmos_v1_2B_action_chunk_conditioned",
         node=COSMOS_V1_2B_NET_MININET_ACTION_CHUNK,
+    )
+    cs.store(
+        group="net_teacher",
+        package="model.config.net_teacher",
+        name="cosmos_v1_14B_action_chunk_conditioned",
+        node=COSMOS_V1_14B_NET_MININET_ACTION_CHUNK,
     )

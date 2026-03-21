@@ -27,6 +27,11 @@ from __future__ import annotations
 import math
 import uuid
 from typing import Callable, Dict, List, Tuple
+from dataclasses import replace
+import torch
+import torchvision.io as io
+import json
+import os
 
 import attrs
 import torch
@@ -195,8 +200,10 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
             - with D_ prefix: input/output of the critic nets fake score net, teacher net, and optionally discriminator.
         """
         # Use the critic net's time to sample noise level because the DMD loss comes fromt he critic net's grad.
-        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.shape, condition)
+        (B, C, T, H, W) = x0_B_C_T_H_W.shape
+        D_time_B_T = self.draw_training_time_D((B, C, self.config.state_t, H, W), condition)
         G_epsilon_B_C_T_H_W, D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W), torch.randn_like(x0_B_C_T_H_W)
+        D_epsilon_B_C_T_H_W = D_epsilon_B_C_T_H_W[:, :, :self.config.state_t, :, :]
         (
             G_epsilon_B_C_T_H_W,
             condition,
@@ -214,6 +221,9 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
             torch.distributed.broadcast(n_steps, src=0)
         n_steps = int(n_steps.item()) + 1
 
+        # Frame Slicing Optimization: Determine cut-off early to avoid generating unused frames
+        G_epsilon_B_C_T_H_W, grad_start_idx = self.prepare_random_slice(G_epsilon_B_C_T_H_W)
+
         # Control artifact dumping frequency (used by interactive W&B callbacks).
         is_rank0 = distributed.is_rank0()
         every_n = self.config.vis_debug_every_n
@@ -227,7 +237,10 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
             n_steps,
             with_grad=True,
             dump_iter=dump_iter,
+            grad_start_idx=grad_start_idx,
         )
+
+        G_x0_theta_B_C_T_H_W, condition = self.slice_generator_output(G_x0_theta_B_C_T_H_W, condition)
 
         # Re-noise student output to construct input to the discriminator
         # Discriminator is the fake score net, uses its intermediate feature and run GAN loss
@@ -305,8 +318,10 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
         """
         Performs a single training step for the fake score net (critic) and optionally the discriminator head.
         """
-        D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.shape, condition)
+        (B, C, T, H, W) = x0_B_C_T_H_W.shape
+        D_time_B_T = self.draw_training_time_D((B, C, self.config.state_t, H, W), condition)
         G_epsilon_B_C_T_H_W, D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W), torch.randn_like(x0_B_C_T_H_W)
+        D_epsilon_B_C_T_H_W = D_epsilon_B_C_T_H_W[:, :, :self.config.state_t, :, :]
         (
             G_epsilon_B_C_T_H_W,
             condition,
@@ -330,9 +345,14 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
             torch.distributed.broadcast(n_steps, src=0)
         n_steps = int(n_steps.item()) + 1
 
+        # Frame Slicing Optimization for Critic as well
+        G_epsilon_B_C_T_H_W, _ = self.prepare_random_slice(G_epsilon_B_C_T_H_W)
+
         # Generate student output G_x0_theta via backward_simulation with gradients on the
         # last step (simulates inference-time few-step sampling).
         G_x0_theta_B_C_T_H_W = self.backward_simulation(condition, G_epsilon_B_C_T_H_W, n_steps, with_grad=False)
+
+        G_x0_theta_B_C_T_H_W, condition = self.slice_generator_output(G_x0_theta_B_C_T_H_W, condition)
 
         # Re-noise student output to construct input to the discriminator
         # Discriminator is the fake score net, uses its intermediate feature and run GAN loss
@@ -381,6 +401,50 @@ class Video2WorldModelDistillDMD2TrigFlow(DistillationCoreMixin, TrigFlowMixin, 
             "gan_loss": loss_gan,
         }
         return output_batch, kendall_loss
+
+    def prepare_random_slice(self, epsilon_B_C_T_H_W):
+        T_total = epsilon_B_C_T_H_W.shape[2]
+        end_frame = T_total
+        grad_start_idx = 0
+        
+        if T_total > self.config.state_t:
+            end_frame_t = torch.randint(low=self.config.state_t, high=(T_total+1), size=(1,), device=self.tensor_kwargs["device"])
+            if torch.distributed.is_initialized():
+                 torch.distributed.broadcast(end_frame_t, src=0)
+            end_frame = int(end_frame_t.item())
+            epsilon_B_C_T_H_W = epsilon_B_C_T_H_W[:, :, :end_frame, :, :]
+            grad_start_idx = max(0, end_frame - (self.config.state_t - 1))
+        
+        return epsilon_B_C_T_H_W, grad_start_idx
+
+    def slice_generator_output(self, G_x0_theta_B_C_T_H_W, condition):
+        end_frame = G_x0_theta_B_C_T_H_W.shape[2]
+
+        G_x0_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W[:, :, :end_frame, :, :]
+        if end_frame != self.config.state_t:
+            with torch.no_grad():
+                pixels = self.decode(G_x0_theta_B_C_T_H_W[:, :, :-(self.config.state_t-1), :, :])
+                frame = pixels[:, :, -1:, :, :]
+                frame_latent = self.encode(frame)
+            G_x0_theta_B_C_T_H_W = torch.cat([frame_latent, G_x0_theta_B_C_T_H_W[:, :, -(self.config.state_t-1):, :, :]], dim=2)
+
+        gt_frames = condition.gt_frames
+        gt_frames = gt_frames[:, :, :end_frame, :, :]
+        if end_frame != self.config.state_t:
+            with torch.no_grad():
+                pixels = self.decode(gt_frames[:, :, :-(self.config.state_t-1), :, :])
+                frame = pixels[:, :, -1:, :, :]
+                frame_latent = self.encode(frame)
+            gt_frames = torch.cat([frame_latent, gt_frames[:, :, -(self.config.state_t-1):, :, :]], dim=2)
+
+        condition = condition.set_video_condition(gt_frames, None, None, num_conditional_frames=1)
+        condition = replace(condition, action=condition.action[:, :((end_frame - 1) * 4), :])
+        condition = replace(condition, action=condition.action[:, -((self.config.state_t - 1) * 4):, :])
+
+        assert G_x0_theta_B_C_T_H_W.shape[2] == self.config.state_t, f"Mismatched number of predicted frames, got {G_x0_theta_B_C_T_H_W.shape[2]}, expected {self.config.state_t}"
+        assert condition.action.shape[1] == (self.config.state_t - 1) * 4, f"Mismatched number of action frames, got {condition.action.shape[1]}, expected {(self.config.state_t - 1) * 4}"
+
+        return G_x0_theta_B_C_T_H_W, condition
 
     # ------------------------ Sampling ------------------------
     def get_x0_fn_from_batch(

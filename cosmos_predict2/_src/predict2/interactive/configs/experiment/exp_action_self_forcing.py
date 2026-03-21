@@ -18,9 +18,9 @@ import math
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
-from cosmos_predict2._src.predict2.distill.utils.config_helper import build_no_s3_run, deep_update_config_dict
 from cosmos_predict2._src.predict2.models.video2world_model import HighSigmaStrategy
 from cosmos_predict2._src.predict2.text_encoders.text_encoder import EmbeddingConcatStrategy
+from cosmos_predict2._src.predict2.distill.utils.config_helper import build_no_s3_run, deep_update_config_dict
 
 
 def make_experiment(
@@ -73,7 +73,8 @@ def make_experiment(
         model=dict(
             config=dict(
                 adjust_video_noise=True,
-                conditional_frames_probs={0: 0.5, 1: 0.25, 2: 0.25},
+                # cpu_offload=True,
+                conditional_frames_probs=None,
                 conditioner=dict(
                     text=dict(
                         dropout_rate=0.0,
@@ -91,42 +92,46 @@ def make_experiment(
                 loss_scale_GAN_generator=1.0,
                 loss_scale_fake_score=1.0,
                 loss_scale_sid=1.0,
-                max_num_conditional_frames=2,
+                max_num_conditional_frames=0,
                 max_simulation_steps=1,
                 max_simulation_steps_fake=4,
                 min_num_conditional_frames=0,
                 net=dict(
-                    action_dim=29,
+                    action_dim=384,
                     temporal_compression_ratio=4,
                     rope_enable_fps_modulation=False,
                     rope_h_extrapolation_ratio=3.0,
                     rope_w_extrapolation_ratio=3.0,
                     rope_t_extrapolation_ratio=1.0,
                     sac_config=dict(mode="mm_only"),
+                    # sac_config=dict(mode="block_wise"),
                     use_crossattn_projection=True,
                     crossattn_proj_in_channels=100352,
                     crossattn_emb_channels=1024,
+                    max_frames=256,
                 ),
                 net_fake_score=dict(
-                    action_dim=29,
+                    action_dim=384,
                     temporal_compression_ratio=4,
                     rope_enable_fps_modulation=False,
                     rope_h_extrapolation_ratio=3.0,
                     rope_w_extrapolation_ratio=3.0,
                     rope_t_extrapolation_ratio=1.0,
                     sac_config=dict(mode="mm_only"),
+                    # sac_config=dict(mode="block_wise"),
                     use_crossattn_projection=True,
                     crossattn_proj_in_channels=100352,
                     crossattn_emb_channels=1024,
                 ),
                 net_teacher=dict(
-                    action_dim=29,
+                    action_dim=384,
                     temporal_compression_ratio=4,
                     rope_enable_fps_modulation=False,
                     rope_h_extrapolation_ratio=3.0,
                     rope_w_extrapolation_ratio=3.0,
                     rope_t_extrapolation_ratio=1.0,
                     sac_config=dict(mode="mm_only"),
+                    # sac_config=dict(mode="block_wise"),
                     use_crossattn_projection=True,
                     crossattn_proj_in_channels=100352,
                     crossattn_emb_channels=1024,
@@ -174,7 +179,7 @@ def make_experiment(
                 text_encoder_class="reason1p1_7B",
                 # Enable generating a decoded video during training so the interactive
                 # W&B callback can log `train/backward_simulation_video`.
-                vis_debug=True,
+                vis_debug=False,
                 vis_debug_every_n=100,
                 text_encoder_config=dict(
                     ckpt_path="s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
@@ -185,7 +190,7 @@ def make_experiment(
             ),
         ),
         checkpoint=dict(
-            save_iter=100,
+            save_iter=1000,
             save_to_object_store=dict(
                 enabled=True,
             ),
@@ -196,7 +201,7 @@ def make_experiment(
             strict_resume=True,
         ),
         trainer=dict(
-            max_iter=1000,
+            max_iter=3000,
             logging_iter=50,
             callbacks=dict(
                 iter_speed=dict(hit_thres=200),
@@ -231,20 +236,20 @@ def make_experiment(
 ####################################
 
 ACTION_GR00T_GR1_SELF_FORCING = make_experiment(
-    name="gr1_i4-a",
-    data="gr00t_gr1_warmup",
+    name="gr1",
+    data="gr00t_customized_gr1_long",
     overrides=dict(
         job=dict(
             project="cosmos_predict2_action_conditioned",
             group="interactive_self_forcing",
         ),
         checkpoint=dict(
-            load_path="cosmos_predict2_action_conditioned/interactive_warmup/gr1_i4/checkpoints/iter_000002000",
+            load_path="checkpoints/self_forcing/gr1/iter_000010000",
         ),
         model=dict(
             config=dict(
                 teacher_load_from=dict(
-                    load_path="s3://bucket/cosmos_predict2_action_conditioned/action_conditional/cosmos_predict2p5_2B_action_conditioned_gr00t_gr1_customized_13frame_full_16nodes/checkpoints/iter_000014000/model",
+                    load_path="checkpoints/warmup/gr1/iter_000050000/model",
                     credentials="credentials/s3_checkpoint.secret",
                 ),
             ),
@@ -254,22 +259,107 @@ ACTION_GR00T_GR1_SELF_FORCING = make_experiment(
 
 ACTION_GR00T_G1_SELF_FORCING = make_experiment(
     name="g1",
-    data="gr00t_g1_warmup",
+    data="gr00t_customized_g1_long",
     overrides=dict(
         job=dict(
             project="cosmos_predict2_action_conditioned",
             group="interactive_self_forcing",
         ),
         checkpoint=dict(
-            load_path="cosmos_predict2_action_conditioned/interactive_warmup/g1/checkpoints/iter_000020000",
+            load_path="checkpoints/self_forcing/g1/iter_000010000",
         ),
         model=dict(
             config=dict(
-                net=dict(action_dim=43),
-                net_fake_score=dict(action_dim=43),
-                net_teacher=dict(action_dim=43),
                 teacher_load_from=dict(
-                    load_path="s3://bucket/cosmos_predict2_action_conditioned/action_conditional/cosmos_predict2p5_2B_action_conditioned_gr00t_g1_gear_wild_merged_customized_13frame_full_16nodes/checkpoints/iter_000038000/model",
+                    load_path="checkpoints/warmup/g1/iter_000050000/model",
+                    credentials="credentials/s3_checkpoint.secret",
+                ),
+            ),
+        ),
+    ),
+)
+
+ACTION_GR00T_AGIBOT_SELF_FORCING = make_experiment(
+    name="agibot",
+    data="gr00t_customized_agibot_long",
+    overrides=dict(
+        job=dict(
+            project="cosmos_predict2_action_conditioned",
+            group="interactive_self_forcing",
+        ),
+        checkpoint=dict(
+            load_path="checkpoints/self_forcing/agibot/iter_000010000",
+        ),
+        model=dict(
+            config=dict(
+                teacher_load_from=dict(
+                    load_path="checkpoints/warmup/agibot/iter_000050000/model",
+                    credentials="credentials/s3_checkpoint.secret",
+                ),
+            ),
+        ),
+    ),
+)
+
+ACTION_GR00T_AGIBOT_FRUIT_SELF_FORCING = make_experiment(
+    name="agibot_fruit",
+    data="gr00t_customized_agibot_fruit_long",
+    overrides=dict(
+        job=dict(
+            project="cosmos_predict2_action_conditioned",
+            group="interactive_self_forcing",
+        ),
+        checkpoint=dict(
+            load_path="checkpoints/self_forcing/agibot_fruit/iter_000010000",
+        ),
+        model=dict(
+            config=dict(
+                teacher_load_from=dict(
+                    load_path="checkpoints/warmup/agibot_fruit/iter_000100000/model",
+                    credentials="credentials/s3_checkpoint.secret",
+                ),
+            ),
+        ),
+    ),
+)
+
+ACTION_GR00T_YAM_SELF_FORCING = make_experiment(
+    name="yam",
+    data="gr00t_customized_yam_long",
+    overrides=dict(
+        job=dict(
+            project="cosmos_predict2_action_conditioned",
+            group="interactive_self_forcing",
+        ),
+        checkpoint=dict(
+            load_path="checkpoints/self_forcing/yam/iter_000010000",
+        ),
+        model=dict(
+            config=dict(
+                teacher_load_from=dict(
+                    load_path="checkpoints/warmup/yam/iter_000050000/model",
+                    credentials="credentials/s3_checkpoint.secret",
+                ),
+            ),
+        ),
+    ),
+)
+
+ACTION_GR00T_PRETRAIN_SELF_FORCING = make_experiment(
+    name="pretrain",
+    data="gr00t_customized_pretrain_long",
+    overrides=dict(
+        job=dict(
+            project="cosmos_predict2_action_conditioned",
+            group="interactive_self_forcing",
+        ),
+        checkpoint=dict(
+            load_path="checkpoints/self_forcing/pretrain/iter_000010000",
+        ),
+        model=dict(
+            config=dict(
+                teacher_load_from=dict(
+                    load_path="checkpoints/warmup/pretrain/iter_000140000/model",
                     credentials="credentials/s3_checkpoint.secret",
                 ),
             ),
@@ -282,18 +372,36 @@ cs = ConfigStore.instance()
 cs.store(
     group="experiment",
     package="_global_",
-    name="cosmos_predict2p5_2B_action_gr00t_gr1_self_forcing",
-    node=ACTION_GR00T_GR1_SELF_FORCING,
-)
-cs.store(
-    group="experiment",
-    package="_global_",
-    name="cosmos_predict2p5_2B_action_gr00t_g1_self_forcing",
-    node=ACTION_GR00T_G1_SELF_FORCING,
-)
-cs.store(
-    group="experiment",
-    package="_global_",
     name="cosmos_predict2p5_2B_action_gr00t_gr1_self_forcing_no_s3",
     node=build_no_s3_run(ACTION_GR00T_GR1_SELF_FORCING),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_g1_self_forcing_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_G1_SELF_FORCING),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_agibot_self_forcing_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_AGIBOT_SELF_FORCING),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_agibot_fruit_self_forcing_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_AGIBOT_FRUIT_SELF_FORCING),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_yam_self_forcing_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_YAM_SELF_FORCING),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_pretrain_self_forcing_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_PRETRAIN_SELF_FORCING),
 )

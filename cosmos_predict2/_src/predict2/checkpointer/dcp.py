@@ -224,6 +224,24 @@ def dcp_load_state_dict(_state_dict, storage_reader, load_planner):
             unexpected_keys_str = "\n".join(sorted(set(".".join(k.split(".")[:10]) for k in unexpected_keys)))
             log.critical(f"Unexpected keys in pretrained model: {unexpected_keys_str}")
 
+    metadata = storage_reader.read_metadata()
+    ckpt_metadata = metadata.state_dict_metadata
+    mismatched_shapes = []
+    for key, tensor in _state_dict.items():
+        if "_extra_state" in key:
+            continue
+        if key in ckpt_metadata:
+            ckpt_shape = torch.Size(ckpt_metadata[key].size)
+            model_shape = tensor.shape
+            if model_shape != ckpt_shape:
+                mismatched_shapes.append(
+                    f"{key}: Model {tuple(model_shape)} vs Ckpt {tuple(ckpt_shape)}"
+                )
+
+    if mismatched_shapes:
+        error_log = "\n".join(mismatched_shapes)
+        log.critical(f"Shape mismatch in pretrained model:\n{error_log}")
+        raise RuntimeError(f"Cannot load checkpoint due to {len(mismatched_shapes)} shape mismatches.")
 
 class ModelWrapper(Stateful):
     """Wrapper for model state dict handling"""

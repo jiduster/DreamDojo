@@ -155,7 +155,8 @@ class ImaginaireTrainer:
             dataloader_val (torch.utils.data.DataLoader): The validation data loader.
         """
         # Leaving this for backward compability for now, but we can think about moving this to model.on_train_start for all models.
-        model = model.to("cuda", memory_format=self.config.trainer.memory_format)  # type: ignore
+        target_device = "cuda" if not self.config.model.config.cpu_offload else "cpu"
+        model = model.to(target_device, memory_format=self.config.trainer.memory_format)  # type: ignore
         model.on_train_start(self.config.trainer.memory_format)
 
         # Initialize the optimizer, scheduler, and grad_scaler.
@@ -175,7 +176,7 @@ class ImaginaireTrainer:
         else:
             raise ValueError(f"Unknown distributed parallelism mode: {self.config.trainer.distributed_parallelism}")
 
-        log.info("Starting training...")
+        log.info("Starting training loop...")
         self.callbacks.on_train_start(model, iteration=iteration)
         # Initial validation.
         if self.config.trainer.run_validation and iteration == 0:

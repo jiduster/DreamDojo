@@ -21,7 +21,11 @@ import torch
 from einops import rearrange
 
 from cosmos_predict2._src.imaginaire.attention import spatio_temporal_attention
-from cosmos_predict2._src.predict2.utils.kv_cache import AttentionOpWithKVCache
+from cosmos_predict2._src.predict2.utils.kv_cache import (
+    AttentionOpWithKVCache,
+    KVCacheLayerState,
+    TensorKVCacheLayerState,
+)
 
 
 def apply_adaln(
@@ -165,7 +169,9 @@ def mlp_block(
     return x_b_t_h_w_d + result
 
 
-def make_network_temporal_causal(net: Any, h_tokens: int, w_tokens: int) -> None:
+def make_network_temporal_causal(
+    net: Any, h_tokens: int, w_tokens: int, window_size: tuple | int = -1
+) -> None:
     """Install temporal-only causal masking using I4 spatio-temporal attention.
 
     Replaces each block's `self_attn.attn_op` with a closure that reshapes QKV to
@@ -179,13 +185,14 @@ def make_network_temporal_causal(net: Any, h_tokens: int, w_tokens: int) -> None
         net: The network instance to modify (modified in place).
         h_tokens: Number of tokens along height per frame (H).
         w_tokens: Number of tokens along width per frame (W).
+        window_size: Window size for spatio-temporal attention.
     """
 
     def _i4_temporal_causal_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **_: dict) -> torch.Tensor:
         q6 = rearrange(q, "b (t h w) hh d -> b t h w hh d", h=h_tokens, w=w_tokens)
         k6 = rearrange(k, "b (t h w) hh d -> b t h w hh d", h=h_tokens, w=w_tokens)
         v6 = rearrange(v, "b (t h w) hh d -> b t h w hh d", h=h_tokens, w=w_tokens)
-        out6 = spatio_temporal_attention(q6, k6, v6)
+        out6 = spatio_temporal_attention(q6, k6, v6, window_size=window_size)
         out4 = rearrange(out6, "b t h w hh d -> b (t h w) (hh d)")
         return out4
 
@@ -193,13 +200,18 @@ def make_network_temporal_causal(net: Any, h_tokens: int, w_tokens: int) -> None
         block.self_attn.attn_op = _i4_temporal_causal_attn
 
 
-def make_network_kv_cache(net: Any, max_cache_size: Optional[int] = None) -> None:
-    """Wrap attention with KV cache support and initialize list-based caches.
+def make_network_kv_cache(
+    net: Any,
+    max_cache_size: Optional[int] = None,
+    stateless: bool = False,
+    use_tensor_state: bool = False,
+) -> None:
+    """Wrap attention with KV cache support and initialize caches.
 
     Each block's self-attention op is wrapped by `AttentionOpWithKVCache`, which adds
     lightweight K/V caching for streaming or chunked inference. Initializes
-    list-based caches and sets a rolling capacity measured in number of chunks
-    (entries), not tokens.
+    list-based (or tensor-based) caches and sets a rolling capacity measured in
+    number of chunks (entries), not tokens.
 
     Expected network structure:
     - `net.blocks`: iterable of blocks with a `.self_attn.attn_op` callable
@@ -209,6 +221,14 @@ def make_network_kv_cache(net: Any, max_cache_size: Optional[int] = None) -> Non
     Args:
         net: The network instance to modify (modified in place).
         max_cache_size: Maximum number of cached chunks to retain (rolling window).
+        stateless: If True, create stateless KV cache wrappers whose state must
+            be supplied externally on each forward call (for ``torch.compile``
+            compatibility).  Use :func:`create_network_kv_state` to obtain the
+            initial empty state.
+        use_tensor_state: If True (requires ``stateless=True``), use pre-allocated
+            tensor caches instead of Python lists.  This eliminates graph breaks
+            under ``torch.compile``, allowing entire DiT blocks to be compiled
+            as a single graph.
 
     Raises:
         AttributeError: If required attributes (e.g., `blocks`, `model_channels`, `num_heads`) are missing.
@@ -218,7 +238,85 @@ def make_network_kv_cache(net: Any, max_cache_size: Optional[int] = None) -> Non
         attn_op: Any = block.self_attn.attn_op
         if not isinstance(attn_op, AttentionOpWithKVCache):
             # Not wrapped yet, create new wrapper
-            attn_op = AttentionOpWithKVCache(block.self_attn.attn_op, max_cache_size=max_cache_size)
+            attn_op = AttentionOpWithKVCache(
+                block.self_attn.attn_op,
+                max_cache_size=max_cache_size,
+                stateless=stateless,
+                use_tensor_state=use_tensor_state,
+            )
             block.self_attn.attn_op = attn_op
+        else:
+            # Already wrapped – update flags and reset
+            attn_op.stateless = stateless
+            attn_op.use_tensor_state = use_tensor_state
         # Reset the KV cache (list-based); pass max_entries as the capacity
         attn_op.reset_kv_cache(max_cache_size=max_cache_size)
+
+
+def create_network_kv_state(net: Any) -> list[Optional[KVCacheLayerState]]:
+    """Create initial empty KV cache state for all layers in a network.
+
+    Returns a list with one entry per block.  Blocks whose self-attention op
+    is a stateless ``AttentionOpWithKVCache`` get an empty
+    ``KVCacheLayerState``; all other blocks get ``None``.
+
+    This is intended for use with ``make_network_kv_cache(net, stateless=True)``
+    to initialise the external state that will be threaded through the forward
+    pass.
+    """
+    states: list[Optional[KVCacheLayerState]] = []
+    for block in net.blocks:
+        attn_op: Any = block.self_attn.attn_op
+        if isinstance(attn_op, AttentionOpWithKVCache) and attn_op.stateless:
+            states.append(AttentionOpWithKVCache.create_empty_state())
+        else:
+            states.append(None)
+    return states
+
+
+def create_network_kv_tensor_state(
+    net: Any,
+    max_frames: int,
+    batch_size: int,
+    tokens_per_frame: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[Optional[TensorKVCacheLayerState]]:
+    """Create initial pre-allocated tensor KV cache state for all layers.
+
+    Returns a list with one entry per block.  Blocks whose self-attention op
+    is a stateless ``AttentionOpWithKVCache`` with ``use_tensor_state=True``
+    get a pair of zero-filled tensors; all other blocks get ``None``.
+
+    Args:
+        net: The network with ``blocks``, ``num_heads``, ``model_channels``.
+        max_frames: Number of frame slots to pre-allocate (= total latent
+            frames per chunk, i.e. T from the noise shape).
+        batch_size: Batch size (typically 1 for inference).
+        tokens_per_frame: Spatial tokens per frame (H_patch * W_patch).
+        device: Device for allocation.
+        dtype: Data type for the cache tensors.
+    """
+    num_heads = net.num_heads
+    head_dim = net.model_channels // num_heads
+
+    states: list[Optional[TensorKVCacheLayerState]] = []
+    for block in net.blocks:
+        attn_op: Any = block.self_attn.attn_op
+        if isinstance(attn_op, AttentionOpWithKVCache) and attn_op.stateless and attn_op.use_tensor_state:
+            states.append(
+                AttentionOpWithKVCache.create_empty_tensor_state(
+                    max_frames=max_frames,
+                    batch_size=batch_size,
+                    tokens_per_frame=tokens_per_frame,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+        elif isinstance(attn_op, AttentionOpWithKVCache) and attn_op.stateless:
+            states.append(AttentionOpWithKVCache.create_empty_state())
+        else:
+            states.append(None)
+    return states

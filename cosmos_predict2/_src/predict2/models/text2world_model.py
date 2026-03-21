@@ -83,7 +83,7 @@ class EMAConfig:
 @attrs.define(slots=False)
 class Text2WorldModelConfig:
     """
-    Config for [DiffusionModel][projects.cosmos.diffusion.v2.models.text2world_model.DiffusionModel].
+    Config for [DiffusionModel][cosmos_predict2._src.predict2.diffusion.v2.models.text2world_model.DiffusionModel].
     """
 
     tokenizer: LazyDict = None
@@ -97,6 +97,7 @@ class Text2WorldModelConfig:
         sigma_min=0.0002,
     )
     fsdp_shard_size: int = 1
+    cpu_offload: bool = False
     sigma_data: float = 0.5
     precision: str = "bfloat16"
     input_data_key: str = "video"  # key to fetch input data from data_batch

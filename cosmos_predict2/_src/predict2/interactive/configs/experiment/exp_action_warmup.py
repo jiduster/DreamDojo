@@ -48,7 +48,7 @@ def make_experiment(
             name=name,
         ),
         checkpoint=dict(
-            save_iter=100,
+            save_iter=1000,
             save_to_object_store=dict(enabled=True),
             load_from_object_store=dict(enabled=True),
             load_training_state=False,
@@ -72,9 +72,10 @@ def make_experiment(
             config=dict(
                 state_t=1 + 12 // 4,
                 net=dict(
-                    action_dim=29,
+                    action_dim=384,
                     num_action_per_chunk=12,
                     timestep_scale=0.001,
+                    # sac_config=dict(mode="block_wise"),
                 ),
                 tokenizer=dict(
                     temporal_window=16,
@@ -122,11 +123,11 @@ def make_experiment(
 ####################################
 
 ACTION_GR00T_WARMUP_GR1 = make_experiment(
-    name="gr1_i4_lr3e-5",
+    name="gr1",
     data="gr00t_gr1_warmup",
     overrides=dict(
         checkpoint=dict(
-            load_path="cosmos_predict2_action_conditioned/action_conditional/cosmos_predict2p5_2B_action_conditioned_gr00t_gr1_customized_13frame_full_16nodes/checkpoints/iter_000014000",
+            load_path="checkpoints/warmup/gr1/iter_000050000",
         ),
     ),
 )
@@ -136,12 +137,47 @@ ACTION_GR00T_WARMUP_G1 = make_experiment(
     data="gr00t_g1_warmup",
     overrides=dict(
         checkpoint=dict(
-            load_path="cosmos_predict2_action_conditioned/action_conditional/cosmos_predict2p5_2B_action_conditioned_gr00t_g1_gear_wild_merged_customized_13frame_full_16nodes/checkpoints/iter_000038000",
+            load_path="checkpoints/warmup/g1/iter_000050000",
         ),
-        model=dict(
-            config=dict(
-                net=dict(action_dim=43),
-            ),
+    ),
+)
+
+ACTION_GR00T_WARMUP_AGIBOT = make_experiment(
+    name="agibot",
+    data="gr00t_agibot_warmup",
+    overrides=dict(
+        checkpoint=dict(
+            load_path="checkpoints/warmup/agibot/iter_000050000",
+        ),
+    ),
+)
+
+ACTION_GR00T_WARMUP_AGIBOT_FRUIT = make_experiment(
+    name="agibot_fruit",
+    data="gr00t_agibot_fruit_warmup",
+    overrides=dict(
+        checkpoint=dict(
+            load_path="checkpoints/warmup/agibot_fruit/iter_000100000",
+        ),
+    ),
+)
+
+ACTION_GR00T_WARMUP_YAM = make_experiment(
+    name="yam",
+    data="gr00t_yam_warmup",
+    overrides=dict(
+        checkpoint=dict(
+            load_path="checkpoints/warmup/yam/iter_000050000",
+        ),
+    ),
+)
+
+ACTION_GR00T_WARMUP_PRETRAIN = make_experiment(
+    name="pretrain",
+    data="gr00t_pretrain_warmup",
+    overrides=dict(
+        checkpoint=dict(
+            load_path="checkpoints/warmup/pretrain/iter_000140000",
         ),
     ),
 )
@@ -152,21 +188,51 @@ torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train --config=cosmos
 
 cs = ConfigStore.instance()
 
-cs.store(
-    group="experiment",
-    package="_global_",
-    name="cosmos_predict2p5_2B_action_gr00t_gr1_warmup",
-    node=ACTION_GR00T_WARMUP_GR1,
-)
-cs.store(
-    group="experiment",
-    package="_global_",
-    name="cosmos_predict2p5_2B_action_gr00t_g1_warmup",
-    node=ACTION_GR00T_WARMUP_G1,
-)
+# cs.store(
+#     group="experiment",
+#     package="_global_",
+#     name="cosmos_predict2p5_2B_action_gr00t_gr1_warmup",
+#     node=ACTION_GR00T_WARMUP_GR1,
+# )
+# cs.store(
+#     group="experiment",
+#     package="_global_",
+#     name="cosmos_predict2p5_2B_action_gr00t_g1_warmup",
+#     node=ACTION_GR00T_WARMUP_G1,
+# )
 cs.store(
     group="experiment",
     package="_global_",
     name="cosmos_predict2p5_2B_action_gr00t_gr1_warmup_no_s3",
     node=build_no_s3_run(ACTION_GR00T_WARMUP_GR1),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_g1_warmup_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_WARMUP_G1),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_agibot_warmup_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_WARMUP_AGIBOT),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_agibot_fruit_warmup_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_WARMUP_AGIBOT_FRUIT),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_yam_warmup_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_WARMUP_YAM),
+)
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_gr00t_pretrain_warmup_no_s3",
+    node=build_no_s3_run(ACTION_GR00T_WARMUP_PRETRAIN),
 )

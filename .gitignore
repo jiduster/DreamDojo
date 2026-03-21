@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials / Secrets
+credentials/
+*.pem
+*.key
+.env
+.env.*
+
+# Data / Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.onnx
+
+# Media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.gif
+!assets/*.gif
+
+# Logs
+*.log
+logs/
+
+# Debug / Output
+debug/
+output*/
+
+# Launchers (internal)
+osmo_launch.py
+ray_launch.py

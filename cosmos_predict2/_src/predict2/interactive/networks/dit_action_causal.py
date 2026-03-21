@@ -32,7 +32,7 @@ from cosmos_predict2._src.predict2.action.networks.action_conditioned_minimal_v1
     ActionChunkConditionedMinimalV1LVGDiT,
 )
 from cosmos_predict2._src.predict2.conditioner import DataType
-from cosmos_predict2._src.predict2.utils.kv_cache import KVCacheConfig, VideoSeqPos
+from cosmos_predict2._src.predict2.utils.kv_cache import KVCacheConfig, KVCacheLayerState, VideoSeqPos
 
 
 class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVGDiT):
@@ -104,6 +104,12 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
         torch.cuda.synchronize()
         self.cuda_graphs_max_t_registered = max_t
         log.info(f"[CUDA Graph Precapture] Done: {len(self.cuda_graphs)} frames captured.")
+    
+    def forward(self, *args, **kwargs):
+        if "video_pos" in kwargs:
+            return self.forward_seq(*args, **kwargs)
+        else:
+            return super().forward(*args, **kwargs)
 
     def forward_seq(
         self,
@@ -118,12 +124,16 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
         img_context_emb: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[Optional[KVCacheLayerState]]]:
         """Forward a sequence chunk with KV caches and correct RoPE alignment.
 
         Accepts/returns per-chunk tensors shaped [B, C, T, H, W]. When action is
         provided, injects action embeddings into the timestep (and AdaLN LoRA) streams.
+
+        When ``kv_states`` is not None (stateless KV cache mode), returns
+        ``(output, new_kv_states)``.  Otherwise returns just the output tensor.
         """
 
         # Match minimal action model behavior: append condition mask channel
@@ -149,6 +159,12 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
                 adaln_lora_B_T_3D = adaln_lora_B_T_3D + action_emb_B_1_3D
 
             t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+            # Ensure float32 output when using wan fp32 strategy.
+            # TE's RMSNorm C++ kernel returns float32 regardless of input dtype;
+            # the PyTorch replacement preserves input dtype, so an explicit cast
+            # is needed for the FinalLayer assertion.
+            if self.use_wan_fp32_strategy:
+                t_embedding_B_T_D = t_embedding_B_T_D.float()
 
         assert isinstance(data_type, DataType), f"Expected DataType, got {type(data_type)}"
 
@@ -177,11 +193,13 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
         else:
             context_input = crossattn_emb
 
-        # Compute RoPE for absolute positions in this chunk
-        T_full = int(video_pos.pos_t.max().item()) + 1
-        H_full = int(video_pos.pos_h.max().item()) + 1
-        W_full = int(video_pos.pos_w.max().item()) + 1
-        rope_full = self.pos_embedder.generate_embeddings(torch.Size([1, T_full, H_full, W_full, self.model_channels]))
+        # Compute RoPE for absolute positions in this chunk.
+        # Use pre-computed Python ints (no Tensor.item()) to avoid graph breaks
+        # under torch.compile.
+        T_full = video_pos.rope_grid_t
+        H_full = video_pos.rope_grid_h
+        W_full = video_pos.rope_grid_w
+        rope_full = self.pos_embedder.generate_embeddings(torch.Size([1, T_full, H_full, W_full, self.model_channels])).to(x_B_T1_H_W_D.device)
         linear_idx = (
             video_pos.pos_t.to(dtype=torch.long) * (H_full * W_full)
             + video_pos.pos_h.to(dtype=torch.long) * W_full
@@ -213,11 +231,21 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
         else:
             blocks = self.blocks
 
+        new_kv_states: Optional[list[Optional[KVCacheLayerState]]] = [] if kv_states is not None else None
         for i, block in enumerate(blocks):
-            x_B_T1_H_W_D = block(
+            block_kv_state = kv_states[i] if kv_states is not None else None
+            block_result = block(
                 x_B_T1_H_W_D,
                 **block_kwargs,
+                kv_state=block_kv_state,
             )
+            if isinstance(block_result, tuple):
+                x_B_T1_H_W_D, new_state = block_result
+                new_kv_states.append(new_state)  # type: ignore[union-attr]
+            else:
+                x_B_T1_H_W_D = block_result
+                if new_kv_states is not None:
+                    new_kv_states.append(None)
 
         # Final head and unpatchify back to [B, C, T, H, W]
         x_B_T_H_W_O = self.final_layer(
@@ -226,4 +254,7 @@ class ActionChunkCausalDITwithConditionalMask(ActionChunkConditionedMinimalV1LVG
             adaln_lora_B_T_3D=adaln_lora_B_T_3D,
         )
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+
+        if new_kv_states is not None:
+            return x_B_C_Tt_Hp_Wp, new_kv_states
         return x_B_C_Tt_Hp_Wp

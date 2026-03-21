@@ -215,7 +215,8 @@ def load_model_state_dict_from_checkpoint(
 
     from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
-    load_from_local = True
+    # load_from_local = True
+    load_from_local = False
     local_s3_ckpt_fp = get_checkpoint_path(cur_key_ckpt_full_path)
 
     if SMOKE:

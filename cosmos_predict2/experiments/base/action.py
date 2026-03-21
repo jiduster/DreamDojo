@@ -90,7 +90,7 @@ _default_groot_config = LazyDict(
             weight_decay=0.1,
         ),
         checkpoint=dict(
-            save_iter=5_000,
+            save_iter=10_000,
             # pyrefly: ignore  # missing-attribute
             load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
             # load_path="/mnt/amlfs-01/shared/shenyuang/cosmos_logs/exp1201/pretrain/checkpoints/iter_000100000/",
@@ -104,7 +104,7 @@ _default_groot_config = LazyDict(
             ),
         ),
         trainer=dict(
-            max_iter=1000000,
+            max_iter=100_000,
             straggler_detection=dict(enabled=False),
             callbacks=dict(
                 every_n_sample_reg=dict(

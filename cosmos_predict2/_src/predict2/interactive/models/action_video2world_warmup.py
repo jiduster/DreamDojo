@@ -40,6 +40,7 @@ class ActionConditionedSFWarmupModelRFConfig(Text2WorldModelRectifiedFlowConfig)
     max_num_conditional_frames: int = 0
     # # This field is not used in warmup but needed for config composition compatibility
     conditional_frames_probs: dict[int, float] | None = None
+    cache_frame_size: int = 3
 
 
 class ActionConditionedSFWarmupModelRF(Text2WorldModelRectifiedFlow):
@@ -81,7 +82,7 @@ class ActionConditionedSFWarmupModelRF(Text2WorldModelRectifiedFlow):
 
         index = torch.randint(
             0,
-            num_denoising_steps_plus_one - 1,
+            num_denoising_steps_plus_one,
             [batch_size, num_frames],
             device=self.tensor_kwargs["device"],
             dtype=torch.long,
@@ -120,7 +121,13 @@ class ActionConditionedSFWarmupModelRF(Text2WorldModelRectifiedFlow):
         # Use tokens per frame after patch embedding (attention operates over patch tokens)
         h_tokens = int(h_latent) // int(self.net.patch_spatial)
         w_tokens = int(w_latent) // int(self.net.patch_spatial)
-        make_network_temporal_causal(self.net, int(h_tokens), int(w_tokens))
+        w_tokens = int(w_latent) // int(self.net.patch_spatial)
+        make_network_temporal_causal(
+            self.net,
+            int(h_tokens),
+            int(w_tokens),
+            window_size=(self.config.cache_frame_size, -1, -1),
+        )
 
         velocity_pred = self.net(
             x_B_C_T_H_W=input_latents.to(**self.tensor_kwargs),

@@ -13,14 +13,14 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from groot_dreams.utils.video import get_all_frames, get_frames_by_timestamps
-from .embodiment_tags import EmbodimentTag
-from .schema import (
+from groot_dreams.data.embodiment_tags import EmbodimentTag
+from groot_dreams.data.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
     LeRobotModalityMetadata,
     LeRobotStateActionMetadata,
 )
-from .transform import ComposedModalityTransform
+from groot_dreams.data.transform.base import ComposedModalityTransform
 
 LE_ROBOT_MODALITY_FILENAME = "meta/modality.json"
 LE_ROBOT_EPISODE_FILENAME = "meta/episodes.jsonl"
@@ -1067,6 +1067,10 @@ class WrappedLeRobotSingleDataset(LeRobotSingleDataset):
                 action_seq[:, 101:147] = delta_actions
             elif "agibot" in str(self.dataset_path).lower():
                 action_seq[:, 147:169] = delta_actions
+            
+            text = ""
+            if "annotation.human.coarse_action" in original_outputs:
+                text = original_outputs["annotation.human.coarse_action"][0].split(":")[-1].strip()
 
             key = action_seq[0:1, :29]
             key[:, :min(original_outputs["state"].shape[1], 29)] = original_outputs["state"][:, :29]

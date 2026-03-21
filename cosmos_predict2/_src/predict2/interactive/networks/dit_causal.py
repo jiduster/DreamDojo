@@ -23,7 +23,7 @@ from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.imaginaire.utils.graph import create_cuda_graph
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import MiniTrainDIT
-from cosmos_predict2._src.predict2.utils.kv_cache import KVCacheConfig, VideoSeqPos
+from cosmos_predict2._src.predict2.utils.kv_cache import KVCacheConfig, KVCacheLayerState, VideoSeqPos
 
 
 class CausalDIT(MiniTrainDIT):
@@ -111,10 +111,14 @@ class CausalDIT(MiniTrainDIT):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-    ) -> torch.Tensor:
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[Optional[KVCacheLayerState]]]:
         """Forward a sequence chunk with KV caches and correct RoPE alignment.
 
         Accepts/returns per-chunk tensors shaped [B, C, T, H, W].
+
+        When ``kv_states`` is not None (stateless KV cache mode), returns
+        ``(output, new_kv_states)``.  Otherwise returns just the output tensor.
         """
         # FlexAttention-only behavior assumed by upstream utilities
 
@@ -140,10 +144,12 @@ class CausalDIT(MiniTrainDIT):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        # Compute RoPE for absolute positions in this chunk
-        T_full = int(video_pos.pos_t.max().item()) + 1
-        H_full = int(video_pos.pos_h.max().item()) + 1
-        W_full = int(video_pos.pos_w.max().item()) + 1
+        # Compute RoPE for absolute positions in this chunk.
+        # Use pre-computed Python ints (no Tensor.item()) to avoid graph breaks
+        # under torch.compile.
+        T_full = video_pos.rope_grid_t
+        H_full = video_pos.rope_grid_h
+        W_full = video_pos.rope_grid_w
         rope_full = self.pos_embedder.generate_embeddings(torch.Size([1, T_full, H_full, W_full, self.model_channels]))
         linear_idx = (
             video_pos.pos_t.to(dtype=torch.long) * (H_full * W_full)
@@ -152,9 +158,11 @@ class CausalDIT(MiniTrainDIT):
         )
         rope_L_1_1_D = rope_full.index_select(0, linear_idx.to(device=rope_full.device))
 
-        # Run blocks
-        for block in self.blocks:
-            x_B_T_H_W_D = block(
+        # Run blocks (with optional stateless KV state threading)
+        new_kv_states: Optional[list[Optional[KVCacheLayerState]]] = [] if kv_states is not None else None
+        for i, block in enumerate(self.blocks):
+            block_kv_state = kv_states[i] if kv_states is not None else None
+            block_result = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
                 context_input,
@@ -162,7 +170,15 @@ class CausalDIT(MiniTrainDIT):
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=None,
                 kv_cache_cfg=kv_cache_cfg,
+                kv_state=block_kv_state,
             )
+            if isinstance(block_result, tuple):
+                x_B_T_H_W_D, new_state = block_result
+                new_kv_states.append(new_state)  # type: ignore[union-attr]
+            else:
+                x_B_T_H_W_D = block_result
+                if new_kv_states is not None:
+                    new_kv_states.append(None)
 
         # Final head and unpatchify back to [B, C, T, H, W]
         x_B_T_H_W_O = self.final_layer(
@@ -171,6 +187,9 @@ class CausalDIT(MiniTrainDIT):
             adaln_lora_B_T_3D=adaln_lora_B_T_3D,
         )
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+
+        if new_kv_states is not None:
+            return x_B_C_Tt_Hp_Wp, new_kv_states
         return x_B_C_Tt_Hp_Wp
 
 
@@ -227,7 +246,8 @@ class CausalDITwithConditionalMask(CausalDIT):
         padding_mask: Optional[torch.Tensor] = None,
         condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-    ) -> torch.Tensor:
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[Optional[KVCacheLayerState]]]:
         if condition_video_input_mask_B_C_T_H_W is None:
             raise ValueError("condition_video_input_mask_B_C_T_H_W must be provided for conditional forward_seq")
 
@@ -243,4 +263,5 @@ class CausalDITwithConditionalMask(CausalDIT):
             fps=fps,
             padding_mask=padding_mask,
             kv_cache_cfg=kv_cache_cfg,
+            kv_states=kv_states,
         )

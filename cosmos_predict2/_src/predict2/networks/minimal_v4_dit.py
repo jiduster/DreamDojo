@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Tuple, Union
 
-from cosmos_predict2._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig
+from cosmos_predict2._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig, KVCacheLayerState
 
 try:
     import megatron.core.parallel_state as parallel_state
@@ -547,14 +547,23 @@ class Attention(nn.Module):
         v,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        kv_state: Optional[KVCacheLayerState] = None,
     ):
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)) or self.backend == "i4":
             additional_args["video_size"] = video_size
         if isinstance(self.attn_op, AttentionOpWithKVCache):
             additional_args["kv_cache_cfg"] = kv_cache_cfg
+            if self.attn_op.stateless:
+                additional_args["kv_state"] = kv_state
 
         result = self.attn_op(q, k, v, **additional_args)  # [B, S, H, D]
+
+        # In stateless KV cache mode, attn_op returns (output, new_state).
+        if isinstance(self.attn_op, AttentionOpWithKVCache) and self.attn_op.stateless:
+            result, new_kv_state = result
+            return self.output_dropout(self.output_proj(result)), new_kv_state
+
         return self.output_dropout(self.output_proj(result))
 
     def forward(
@@ -564,6 +573,7 @@ class Attention(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        kv_state: Optional[KVCacheLayerState] = None,
     ):
         """
         Args:
@@ -571,9 +581,12 @@ class Attention(nn.Module):
             context (Optional[Tensor]): The key tensor of shape [B, Mk, K] or use x as context [self attention] if None
             rope_emb (Optional[Tensor]): RoPE embedding tensor, or no RoPE embeddings (i.e. in cross attention)
             video_size(VideoSize): Shape [T, H, W]
+            kv_state: Per-layer KV cache state for stateless mode.
+                When the underlying attn_op is a stateless AttentionOpWithKVCache,
+                this returns (output, new_kv_state).  Otherwise returns output only.
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
+        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg, kv_state=kv_state)
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
         # self.attn_op.set_context_parallel_group(process_group, ranks, stream, cp_comm_type="a2a")
@@ -1264,7 +1277,14 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-    ) -> torch.Tensor:
+        kv_state: Optional[KVCacheLayerState] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCacheLayerState]:
+        """Transformer block forward.
+
+        When ``kv_state`` is not None (stateless KV cache mode), returns
+        ``(output, new_kv_state)``.  Otherwise returns just the output tensor
+        (backward-compatible with existing callers).
+        """
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
@@ -1323,15 +1343,24 @@ class Block(nn.Module):
         if self.cp_size is not None and self.cp_size > 1:
             video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
 
+        # Self-attention with optional stateless KV cache state threading
+        self_attn_result = self.self_attn(
+            rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+            video_size=video_size,
+            kv_cache_cfg=kv_cache_cfg,
+            kv_state=kv_state,
+        )
+
+        new_kv_state: Optional[KVCacheLayerState] = None
+        if isinstance(self_attn_result, tuple):
+            self_attn_output, new_kv_state = self_attn_result
+        else:
+            self_attn_output = self_attn_result
+
         result_B_T_H_W_D = rearrange(
-            self.self_attn(
-                # normalized_x_B_T_HW_D,
-                rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                None,
-                rope_emb=rope_emb_L_1_1_D,
-                video_size=video_size,
-                kv_cache_cfg=kv_cache_cfg,
-            ),
+            self_attn_output,
             "b (t h w) d -> b t h w d",
             t=T,
             h=H,
@@ -1380,6 +1409,9 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
+
+        if new_kv_state is not None:
+            return x_B_T_H_W_D, new_kv_state
         return x_B_T_H_W_D
 
 
@@ -1703,7 +1735,7 @@ class MiniTrainDIT(WeightTrainingStat):
             extra_pos_emb = None
 
         if "rope" in self.pos_emb_cls.lower():
-            return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, fps=fps), extra_pos_emb
+            return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, fps=fps).to(x_B_T_H_W_D.device), extra_pos_emb
         x_B_T_H_W_D = x_B_T_H_W_D + self.pos_embedder(x_B_T_H_W_D)  # [B, T, H, W, D]
 
         return x_B_T_H_W_D, None, extra_pos_emb
@@ -1834,17 +1866,17 @@ class MiniTrainDIT(WeightTrainingStat):
 
         return self
 
-    def fully_shard(self, mesh):
+    def fully_shard(self, mesh, offload_policy=None):
         for i, block in enumerate(self.blocks):
             reshard_after_forward = i < len(self.blocks) - 1
-            fully_shard(block, mesh=mesh, reshard_after_forward=reshard_after_forward)
+            fully_shard(block, mesh=mesh, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
 
-        fully_shard(self.final_layer, mesh=mesh, reshard_after_forward=True)
+        fully_shard(self.final_layer, mesh=mesh, reshard_after_forward=True, offload_policy=offload_policy)
         if self.extra_per_block_abs_pos_emb:
-            fully_shard(self.extra_pos_embedder, mesh=mesh, reshard_after_forward=True)
-        fully_shard(self.t_embedder, mesh=mesh, reshard_after_forward=False)
+            fully_shard(self.extra_pos_embedder, mesh=mesh, reshard_after_forward=True, offload_policy=offload_policy)
+        fully_shard(self.t_embedder, mesh=mesh, reshard_after_forward=False, offload_policy=offload_policy)
         if self.extra_image_context_dim is not None:
-            fully_shard(self.img_context_proj, mesh=mesh, reshard_after_forward=False)
+            fully_shard(self.img_context_proj, mesh=mesh, reshard_after_forward=False, offload_policy=offload_policy)
 
     def disable_context_parallel(self):
         # pos_embedder

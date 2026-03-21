@@ -62,18 +62,21 @@ def log_prof_data(
     summary_df = pd.DataFrame({"Avg": avg_values, "Max": max_values, "Min": min_values})
 
     if wandb.run:
-        # Log the table
-        table = wandb.Table(dataframe=df)
-        wandb.log({"DeviceMonitor/prof_data": table}, step=iteration)
+        try:
+            # Log the table
+            table = wandb.Table(dataframe=df)
+            wandb.log({"DeviceMonitor/prof_data": table}, step=iteration)
 
-        # Log summary statistics
-        summary = {}
-        for key in columns[2:]:
-            summary[f"DeviceMonitor/min_{key}"] = min_values[key]
-            summary[f"DeviceMonitor/max_{key}"] = max_values[key]
-            summary[f"DeviceMonitor/avg_{key}"] = avg_values[key]
+            # Log summary statistics
+            summary = {}
+            for key in columns[2:]:
+                summary[f"DeviceMonitor/min_{key}"] = min_values[key]
+                summary[f"DeviceMonitor/max_{key}"] = max_values[key]
+                summary[f"DeviceMonitor/avg_{key}"] = avg_values[key]
 
-        wandb.log(summary, step=iteration)
+            wandb.log(summary, step=iteration)
+        except Exception as e:
+            log.warning(f"Failed to log device monitor data with error {e}")
     return df, summary_df
 
 

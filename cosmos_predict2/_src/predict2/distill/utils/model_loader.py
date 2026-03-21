@@ -23,6 +23,8 @@ from cosmos_predict2._src.imaginaire.lazy_config import instantiate
 from cosmos_predict2._src.imaginaire.utils import log, misc
 from cosmos_predict2._src.imaginaire.utils.config_helper import get_config_module, override
 from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
+
+from cosmos_predict2._src.predict2.checkpointer.dcp import dcp_load_state_dict
 from cosmos_predict2._src.predict2.distill.checkpointer.dcp import (
     DefaultLoadPlanner,
     DistributedCheckpointer,
@@ -131,7 +133,8 @@ def load_model_state_dict_from_checkpoint(
     local_cache_dir=None,
     override_cache: bool = False,
 ):
-    load_from_local = "s3://" not in s3_checkpoint_dir
+    # load_from_local = True
+    load_from_local = False
     local_s3_ckpt_fp = s3_checkpoint_dir
 
     if load_from_local:
@@ -150,11 +153,7 @@ def load_model_state_dict_from_checkpoint(
 
         _state_dict = _model_wrapper.state_dict()
 
-        dcp.load(
-            _state_dict,
-            storage_reader=storage_reader,
-            planner=DefaultLoadPlanner(allow_partial_load=True),
-        )
+        dcp_load_state_dict(_state_dict, storage_reader, load_planner=DefaultLoadPlanner(allow_partial_load=True))
         _model_wrapper.load_state_dict(_state_dict)
         if local_cache_dir is not None:
             log.info(f"Caching model state dict to {local_s3_ckpt_fp}")

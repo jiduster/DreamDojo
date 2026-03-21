@@ -85,7 +85,10 @@ def clip_grad_norm_(
     if isinstance(total_norm, DTensor):
         # Will reach here if any non-PP parallelism is used.
         # If only using PP, total_norm will be a local tensor.
-        total_norm = total_norm.full_tensor()
+        if total_norm.device.type == "cpu":
+            total_norm = total_norm.cuda().full_tensor().cpu()
+        else:
+            total_norm = total_norm.full_tensor()
 
     if pp_mesh is not None:
         if math.isinf(norm_type):

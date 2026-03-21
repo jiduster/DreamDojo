@@ -17,6 +17,8 @@ import glob
 import json
 import os
 from typing import Optional
+import decord
+from decord import VideoReader, cpu
 
 import numpy as np
 import torch
@@ -37,6 +39,7 @@ class ActionDatasetSFWarmup(Dataset):
         # define subdirectories
         self.actions_subdir = "actions"
         self.images_subdir = "images"
+        self.videos_subdir = "videos"
         self.latents_subdir = "latents"
 
         # check for .pt files under latents_subdir
@@ -47,10 +50,11 @@ class ActionDatasetSFWarmup(Dataset):
             for filename in latents_filenames
             if os.path.exists(f"{self.data_path}/{self.actions_subdir}/{filename}.json")
             and os.path.exists(f"{self.data_path}/{self.images_subdir}/{filename}.png")
+            and os.path.exists(f"{self.data_path}/{self.videos_subdir}/{filename}.mp4")
         ]
         log.info(f"Found {len(self.samples)} data samples")
 
-        # load cr1 empty string text embeddings
+        self.t5_text_embeddings, self.t5_text_mask = None, None
         if cr1_embeddings_path is not None:
             self.t5_text_embeddings = torch.load(extract_cr1_embedding(cr1_embeddings_path), map_location="cpu")[0]
             self.t5_text_mask = torch.ones(self.t5_text_embeddings.shape[0])
@@ -63,8 +67,11 @@ class ActionDatasetSFWarmup(Dataset):
         action = torch.tensor(json.load(open(f"{self.data_path}/{self.actions_subdir}/{filename}.json")))  # (12, 29)
         image = Image.open(f"{self.data_path}/{self.images_subdir}/{filename}.png")
         image = torch.tensor(np.array(image)).permute(2, 0, 1)  # (3, 480, 832)
-        vid_input = image.unsqueeze(1)
-        vid_input = torch.cat([vid_input, torch.zeros_like(vid_input).repeat(1, action.shape[0], 1, 1)], dim=1)
+        # vid_input = image.unsqueeze(1)
+        # vid_input = torch.cat([vid_input, torch.zeros_like(vid_input).repeat(1, action.shape[0], 1, 1)], dim=1)
+        vr = VideoReader(f"{self.data_path}/{self.videos_subdir}/{filename}.mp4", ctx=cpu(0))
+        vid_input = vr.get_batch(range(len(vr)))
+        vid_input = torch.from_numpy(vid_input.asnumpy()).permute(3, 0, 1, 2).contiguous()
         latent = torch.load(f"{self.data_path}/{self.latents_subdir}/{filename}.pt")
         latent_array = torch.stack([latent[0], latent[9], latent[18], latent[27], latent[34]], dim=0)
         out = dict(
@@ -79,7 +86,7 @@ class ActionDatasetSFWarmup(Dataset):
             video=vid_input,
             fps=4,
         )
-        if hasattr(self, "t5_text_embeddings"):
+        if self.t5_text_embeddings is not None and self.t5_text_mask is not None:
             out["t5_text_embeddings"] = self.t5_text_embeddings
             out["t5_text_mask"] = self.t5_text_mask
         return out

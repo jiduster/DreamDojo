@@ -30,7 +30,7 @@ class EveryN(Callback):
         every_n: Optional[int] = None,
         step_size: int = 1,
         barrier_after_run: bool = True,
-        run_at_start: bool = True,
+        run_at_start: bool = False,
     ) -> None:
         """Constructor for `EveryN`.
 

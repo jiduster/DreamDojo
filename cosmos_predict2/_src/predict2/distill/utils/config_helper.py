@@ -12,10 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import copy
+
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
 
-def build_no_s3_run(job: dict, local_path: bool = False) -> dict:
+def build_no_s3_run(job: dict, local_path: bool = True) -> dict:
     """
     Make a copy of the input config that doesn't require S3 for checkpointing
     and I/O in the callbacks.
@@ -27,11 +30,15 @@ def build_no_s3_run(job: dict, local_path: bool = False) -> dict:
         model_url = f"s3://bucket/{job['checkpoint']['load_path']}/model"
         load_path = get_checkpoint_path(model_url)
     defaults = job.get("defaults", [])
-    no_s3_run = dict(
+    
+    # Create a deep copy of the job to preserve all other configurations (e.g. model, net)
+    no_s3_run = copy.deepcopy(job)
+    
+    overrides = dict(
         defaults=defaults + ["_self_"] if "_self_" not in defaults else defaults,
         job=dict(
             name=f"{job['job']['name']}_no_s3" + "_${now:%Y-%m-%d}_${now:%H-%M-%S}",
-            wandb_mode="offline",
+            # wandb_mode="offline",
         ),
         checkpoint=dict(
             save_to_object_store=dict(enabled=False, credentials=""),
@@ -52,7 +59,8 @@ def build_no_s3_run(job: dict, local_path: bool = False) -> dict:
             ),
         ),
     )
-    return no_s3_run
+    
+    return deep_update_config_dict(no_s3_run, overrides)
 
 
 def deep_update_config_dict(dst: dict, src: dict) -> dict:

@@ -16,6 +16,8 @@ import torch
 from einops import rearrange
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed._tensor.api import DTensor
+from torch.distributed.fsdp import CPUOffloadPolicy
+
 
 from cosmos_predict2._src.imaginaire.lazy_config import instantiate as lazy_instantiate
 from cosmos_predict2._src.imaginaire.modules.res_sampler import Sampler
@@ -28,14 +30,18 @@ from cosmos_predict2._src.predict2.distill.models.video2world_model_distill_dmd2
     Video2WorldModelDistillationConfigDMD2TrigFlow,
     Video2WorldModelDistillDMD2TrigFlow,
 )
-from cosmos_predict2._src.predict2.interactive.networks.utils import make_network_kv_cache
+from cosmos_predict2._src.predict2.interactive.networks.utils import (
+    create_network_kv_state,
+    create_network_kv_tensor_state,
+    make_network_kv_cache,
+)
 from cosmos_predict2._src.predict2.utils.dtensor_helper import broadcast_dtensor_model_states
-from cosmos_predict2._src.predict2.utils.kv_cache import KVCacheConfig, VideoSeqPos
+from cosmos_predict2._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig, KVCacheLayerState, TensorKVCacheLayerState, VideoSeqPos
 
 
 @attrs.define(slots=False)
 class ActionVideo2WorldModelTrigflowSelfForcingDMD2Config(Video2WorldModelDistillationConfigDMD2TrigFlow):
-    cache_frame_size: int = -1  # if -1, will use the same as the video frame size
+    cache_frame_size: int = 3  # if -1, will use the same as the video frame size
 
 
 class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2TrigFlow):
@@ -61,12 +67,15 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
 
             self._param_count = count_params(net, verbose=False)
 
+            offload_policy, target_device = None, "cuda"
             if self.fsdp_device_mesh and not no_fsdp:
-                net.fully_shard(mesh=self.fsdp_device_mesh)
-                net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True)
+                if self.config.cpu_offload:
+                    offload_policy, target_device = CPUOffloadPolicy(), "cpu"
+                net.fully_shard(mesh=self.fsdp_device_mesh, offload_policy=offload_policy)
+                net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True, offload_policy=offload_policy)
 
             with misc.timer("meta to cuda and broadcast model states"):
-                net.to_empty(device="cuda")
+                net.to_empty(device=target_device)
                 # IMPORTANT: model init should not depend on current tensor shape, or it can handle DTensor shape.
                 net.init_weights()
 
@@ -101,8 +110,12 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
                 log.info("==========Loading teacher checkpoint to TEACHER net (load teacher weight)==========")
                 self.load_ckpt_to_net(self.net_teacher, config.teacher_load_from.load_path)
 
-            self.net = self.build_net(config.net, no_fsdp=True)
-            log.info("==========Loading student checkpoint to STUDENT net (no weight; no fsdp)==========")
+            if config.cpu_offload:
+                self.net = self.build_net(config.net)  # Switch to this for 14B training
+                log.info("==========Loading student checkpoint to STUDENT net (no weight; FSDP enabled)==========")
+            else:
+                self.net = self.build_net(config.net, no_fsdp=True)
+                log.info("==========Loading student checkpoint to STUDENT net (no weight; no fsdp)==========")
 
             # fake score net for approximating score func of the student generator output
             if config.net_fake_score:
@@ -150,7 +163,10 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
 
             # create ema model
             if config.ema.enabled:
-                self.net_ema = self.build_net(config.net, no_fsdp=True)
+                if config.cpu_offload:
+                    self.net_ema = self.build_net(config.net)  # Switch to this for 14B training
+                else:
+                    self.net_ema = self.build_net(config.net, no_fsdp=True)
                 self.net_ema.requires_grad_(False)
 
                 self.net_ema_worker = FastEmaModelUpdater()
@@ -168,7 +184,13 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         condition: ActionConditionedCondition,
         video_pos: VideoSeqPos,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-    ) -> torch.Tensor:
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[Optional[KVCacheLayerState]]]:
+        """Denoise one step with EDM preconditioning.
+
+        When ``kv_states`` is not None (stateless KV cache mode), returns
+        ``(x0_pred, new_kv_states)``.  Otherwise returns just ``x0_pred``.
+        """
         B, C, _, H, W = x_B_C_T_H_W.shape
 
         assert timesteps_B_T.ndim == 2, f"time shape {timesteps_B_T.shape} is not supported"
@@ -189,20 +211,30 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         net_state_in_B_C_T_H_W = x_B_C_T_H_W * c_in_B_1_T_1_1
 
         # forward pass through the network
-        net_output_B_C_T_H_W = (
-            self.net.forward_seq(
-                x_B_C_T_H_W=net_state_in_B_C_T_H_W.to(**self.tensor_kwargs),
-                video_pos=video_pos,
-                timesteps_B_T=c_noise_B_1_T_1_1.squeeze(dim=[1, 3, 4]).to(**self.tensor_kwargs),
-                kv_cache_cfg=kv_cache_cfg,
-                **condition.to_dict(),
-            )
-            .float()
-            .to(dtype=x_B_C_T_H_W.dtype)
+        net_kwargs = dict(
+            x_B_C_T_H_W=net_state_in_B_C_T_H_W.to(**self.tensor_kwargs),
+            video_pos=video_pos,
+            timesteps_B_T=c_noise_B_1_T_1_1.squeeze(dim=[1, 3, 4]).to(**self.tensor_kwargs),
+            kv_cache_cfg=kv_cache_cfg,
+            **condition.to_dict(),
         )
+        if kv_states is not None:
+            net_kwargs["kv_states"] = kv_states
+
+        net_result = self.net(**net_kwargs)
+
+        new_kv_states: Optional[list[Optional[KVCacheLayerState]]] = None
+        if isinstance(net_result, tuple):
+            net_output_B_C_T_H_W, new_kv_states = net_result
+            net_output_B_C_T_H_W = net_output_B_C_T_H_W.float().to(dtype=x_B_C_T_H_W.dtype)
+        else:
+            net_output_B_C_T_H_W = net_result.float().to(dtype=x_B_C_T_H_W.dtype)
 
         # EDM reconstruction of x0
         x0_pred_B_C_T_H_W = c_skip_B_1_T_1_1 * x_B_C_T_H_W + c_out_B_1_T_1_1 * net_output_B_C_T_H_W
+
+        if new_kv_states is not None:
+            return x0_pred_B_C_T_H_W, new_kv_states
         return x0_pred_B_C_T_H_W
 
     def backward_simulation(
@@ -212,6 +244,7 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         n_steps: int,
         with_grad: bool = False,
         dump_iter: int | None = None,
+        grad_start_idx: int | None = None,
     ) -> torch.Tensor:
         """Few-step causal AR student with KV cache sampling including actions.
 
@@ -225,6 +258,7 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
             cache_frame_size=self.config.cache_frame_size,
             enable_grad_on_last_hop=with_grad,
             use_cuda_graphs=False,
+            grad_start_idx=grad_start_idx,
         )
 
         if dump_iter is not None:
@@ -251,7 +285,13 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         full_video_pos: VideoSeqPos,
         n_steps: int,
         enable_grad_on_last_hop: bool = False,
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
     ) -> torch.Tensor:
+        """Generate one frame via multi-step denoising.
+
+        ``kv_states`` is read-only here (``store_kv=False``); the returned
+        tensor is just the predicted frame.
+        """
         assert n_steps >= 1
         t_steps = self.config.selected_sampling_time
         K = len(t_steps)
@@ -273,20 +313,26 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
             grad_ctx = torch.enable_grad if (enable_grad_on_last_hop and is_final_hop) else torch.no_grad
             with grad_ctx():
                 condition_dict = condition.to_dict()
-                zero_mask = condition.condition_video_input_mask_B_C_T_H_W[:, :, t_idx : t_idx + 1]  # should be zeros
+                if condition.condition_video_input_mask_B_C_T_H_W.shape[2] > 1:
+                    zero_mask = condition.condition_video_input_mask_B_C_T_H_W[:, :, t_idx : t_idx + 1]  # should be zeros
+                else:
+                    zero_mask = condition.condition_video_input_mask_B_C_T_H_W
                 action_frame = condition.action[:, (t_idx - start_idx) * A : (t_idx - start_idx + 1) * A]
                 condition_dict.update(
                     action=action_frame,
                     condition_video_input_mask_B_C_T_H_W=zero_mask,
                 )
                 condition_frame = ActionConditionedCondition(**condition_dict)
-                x0_pred = self.denoise_edm_seq(
+                denoise_result = self.denoise_edm_seq(
                     x_B_C_T_H_W=frame_seq,
                     timesteps_B_T=t_tensor,
                     condition=condition_frame,
                     video_pos=cur_video_pos,
                     kv_cache_cfg=kv_cache_cfg,
+                    kv_states=kv_states,
                 )
+                # store_kv=False so state is unchanged; just extract the prediction
+                x0_pred = denoise_result[0] if isinstance(denoise_result, tuple) else denoise_result
 
             if s_idx == n_steps - 1:
                 x0_pred_last = x0_pred
@@ -305,18 +351,28 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         condition: ActionConditionedCondition,
         init_noise: torch.Tensor,
         n_steps: int,
-        cache_frame_size: int = -1,
+        cache_frame_size: int = 3,
         enable_grad_on_last_hop: bool = False,
         use_cuda_graphs: bool = True,
+        start_idx: int = 1,
+        grad_start_idx: int | None = None,
+        stateless_kv: bool = False,
     ) -> torch.Tensor:
+        """Generate a streaming video autoregressively with KV cache.
+
+        Args:
+            stateless_kv: If True, use stateless KV cache mode where all cache
+                state is maintained externally (outside the network forward pass)
+                rather than stored on the module.  This is required for
+                ``torch.compile`` compatibility.  When False (default), the
+                existing stateful KV cache behaviour is used.
+        """
         t_steps = self.config.selected_sampling_time
         K = len(t_steps)
         assert 1 <= n_steps <= K
 
         init_noise = init_noise.to(**self.tensor_kwargs)
-
         B, C, T, H, W = init_noise.shape
-        start_idx = 1
 
         initial_latent = condition.gt_frames[:, :, :start_idx].clone()
         output_latents = torch.zeros([B, C, T, H, W], device=init_noise.device, dtype=init_noise.dtype)
@@ -326,7 +382,30 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
         token_w = W // self.net.patch_spatial
 
         max_cache_size = T if cache_frame_size == -1 else cache_frame_size
-        make_network_kv_cache(self.net, max_cache_size=max_cache_size)
+
+        # Detect whether the network is configured for tensor KV cache
+        # (set by _setup_torch_compile in the streaming inference code).
+        _sample_attn_op = getattr(self.net.blocks[0].self_attn, "attn_op", None)
+        _use_tensor = (
+            isinstance(_sample_attn_op, AttentionOpWithKVCache)
+            and _sample_attn_op.use_tensor_state
+        )
+        make_network_kv_cache(self.net, max_cache_size=max_cache_size, stateless=stateless_kv, use_tensor_state=_use_tensor)
+
+        # In stateless mode, create initial empty KV state outside the network
+        kv_states: Optional[list] = None
+        if stateless_kv:
+            if _use_tensor:
+                kv_states = create_network_kv_tensor_state(
+                    self.net,
+                    max_frames=T,
+                    batch_size=B,
+                    tokens_per_frame=token_h * token_w,
+                    device=init_noise.device,
+                    dtype=init_noise.dtype,
+                )
+            else:
+                kv_states = create_network_kv_state(self.net)
 
         # Pre-capture CUDA graphs for each frame in advance
         if self.net.use_cuda_graphs and use_cuda_graphs:
@@ -341,31 +420,20 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
             )
         full_video_pos = VideoSeqPos(T=T, H=token_h, W=token_w)
 
-        A = self.net._num_action_per_latent_frame
+        for f in range(start_idx):
+            kv_states = self.update_kv_cache(
+                initial_latent[:, :, f : f + 1], condition, full_video_pos, f, start_idx, B, init_noise.device,
+                kv_states=kv_states,
+            )
 
-        if start_idx > 0:
-            for f in range(start_idx):
-                cur_video_pos = full_video_pos.frame(f)
-                cur_frame = initial_latent[:, :, f : f + 1]
-                kv_cache_cfg_prefill = KVCacheConfig(run_with_kv=True, store_kv=True, current_idx=f)
-
-                condition_dict = condition.to_dict()
-                zero_mask = condition.condition_video_input_mask_B_C_T_H_W[:, :, f : f + 1]  # should be zeros
-                condition_dict.update(
-                    action=None,
-                    condition_video_input_mask_B_C_T_H_W=zero_mask,
-                )
-                condition_frame = ActionConditionedCondition(**condition_dict)
-                _ = self.denoise_edm_seq(
-                    x_B_C_T_H_W=cur_frame,
-                    timesteps_B_T=torch.zeros(B, 1, device=init_noise.device, dtype=self.tensor_kwargs["dtype"]),
-                    condition=condition_frame,
-                    video_pos=cur_video_pos,
-                    kv_cache_cfg=kv_cache_cfg_prefill,
-                )
+        if grad_start_idx is None:
+            grad_start_idx = 0
 
         for t_idx in range(start_idx, T):
             frame_noise = init_noise[:, :, t_idx : t_idx + 1]
+            # Only enable gradients if we are past the start index AND checking the last hop
+            do_grad = enable_grad_on_last_hop and (t_idx >= grad_start_idx)
+
             x0_pred_last = self.generate_next_frame(
                 condition,
                 frame_noise,
@@ -373,31 +441,55 @@ class ActionVideo2WorldModelTrigflowSelfForcingDMD2(Video2WorldModelDistillDMD2T
                 start_idx,
                 full_video_pos=full_video_pos,
                 n_steps=n_steps,
-                enable_grad_on_last_hop=enable_grad_on_last_hop,
+                enable_grad_on_last_hop=do_grad,
+                kv_states=kv_states,
             )
-
-            # Commit the newly generated frame
             output_latents[:, :, t_idx : t_idx + 1] = x0_pred_last
-
-            # Prefill KV cache with the clean generated frame for future steps
-            cur_video_pos = full_video_pos.frame(t_idx)
-            kv_cache_cfg_prefill = KVCacheConfig(run_with_kv=True, store_kv=True, current_idx=t_idx)
-
-            condition_dict = condition.to_dict()
-            zero_mask = condition.condition_video_input_mask_B_C_T_H_W[:, :, t_idx : t_idx + 1]  # should be zeros
-            action_frame = condition.action[:, (t_idx - start_idx) * A : (t_idx - start_idx + 1) * A]
-            condition_dict.update(
-                action=action_frame,
-                condition_video_input_mask_B_C_T_H_W=zero_mask,
-            )
-            condition_frame = ActionConditionedCondition(**condition_dict)
-            with torch.no_grad():
-                _ = self.denoise_edm_seq(
-                    x_B_C_T_H_W=x0_pred_last,
-                    timesteps_B_T=torch.zeros(B, 1, device=init_noise.device, dtype=self.tensor_kwargs["dtype"]),
-                    condition=condition_frame,
-                    video_pos=cur_video_pos,
-                    kv_cache_cfg=kv_cache_cfg_prefill,
+            if t_idx < T - 1:
+                kv_states = self.update_kv_cache(
+                    x0_pred_last, condition, full_video_pos, t_idx, start_idx, B, init_noise.device,
+                    kv_states=kv_states,
                 )
 
         return output_latents
+
+    def update_kv_cache(
+        self, frame, condition, full_video_pos, frame_idx, start_idx, B, device,
+        kv_states: Optional[list[Optional[KVCacheLayerState]]] = None,
+    ) -> Optional[list[Optional[KVCacheLayerState]]]:
+        """Run a forward pass with ``store_kv=True`` to populate the KV cache.
+
+        In stateful mode (``kv_states=None``), the cache is updated in-place on
+        the network modules and ``None`` is returned.
+
+        In stateless mode (``kv_states`` provided), the updated state is
+        returned.  The caller should use the returned value for subsequent calls.
+        """
+        kv_cache_cfg_prefill = KVCacheConfig(run_with_kv=True, store_kv=True, current_idx=frame_idx)
+
+        condition_dict = condition.to_dict()
+        if condition.condition_video_input_mask_B_C_T_H_W.shape[2] > 1:
+            zero_mask = condition.condition_video_input_mask_B_C_T_H_W[:, :, frame_idx : frame_idx + 1]  # should be zeros
+        else:
+            zero_mask = condition.condition_video_input_mask_B_C_T_H_W
+        A = self.net._num_action_per_latent_frame
+        action_frame = condition.action[:, (frame_idx - 1) * A : frame_idx * A] if frame_idx > 0 else None
+        condition_dict.update(
+            action=action_frame,
+            condition_video_input_mask_B_C_T_H_W=zero_mask,
+        )
+        condition_frame = ActionConditionedCondition(**condition_dict)
+        with torch.no_grad():
+            denoise_result = self.denoise_edm_seq(
+                x_B_C_T_H_W=frame,
+                timesteps_B_T=torch.zeros(B, 1, device=device, dtype=self.tensor_kwargs["dtype"]),
+                condition=condition_frame,
+                video_pos=full_video_pos.frame(frame_idx),
+                kv_cache_cfg=kv_cache_cfg_prefill,
+                kv_states=kv_states,
+            )
+        # In stateless mode, return the updated kv_states
+        if isinstance(denoise_result, tuple):
+            _, new_kv_states = denoise_result
+            return new_kv_states
+        return kv_states
