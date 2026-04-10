@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -66,10 +67,16 @@ class Processor:
         else:
             self.is_vision_tokenizer = True
 
-        s3_uri = f"s3://bucket/cosmos_reasoning1/pretrained/Qwen_tokenizer/{name}/"
-        from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
-
-        cache_dir = get_checkpoint_path(s3_uri)
+        # Local path override (to avoid mandatory remote download/authentication).
+        # If provided, the path should point to a directory consumable by AutoProcessor.
+        # For example: /mnt/ceph2/ckpt/Cosmos-Reason1-7B
+        local_reason1_dir = os.environ.get("COSMOS_LOCAL_REASON1_TOKENIZER_DIR", "").strip()
+        if local_reason1_dir:
+            cache_dir = local_reason1_dir
+        elif cache_dir is None:
+            s3_uri = f"s3://bucket/cosmos_reasoning1/pretrained/Qwen_tokenizer/{name}/"
+            from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
+            cache_dir = get_checkpoint_path(s3_uri)
 
         self.processor = AutoProcessor.from_pretrained(cache_dir)
         log.info("Successfully loaded processor from local cache")

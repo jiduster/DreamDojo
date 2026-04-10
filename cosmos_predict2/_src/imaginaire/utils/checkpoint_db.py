@@ -951,10 +951,31 @@ def get_checkpoint_path(checkpoint_uri: str) -> str:
     """
     if INTERNAL:
         return checkpoint_uri
+    # Opt-out switch for environments that must avoid remote checkpoint resolution
+    # during config import (e.g., offline / gated HF access).
+    # When enabled, caller-provided local checkpoint paths continue to work.
+    disable_remote = os.environ.get("COSMOS_DISABLE_REMOTE_CKPT_RESOLVE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    # Some runtime components (e.g., tokenizer / text encoder) still need remote
+    # resolution when local files are not provided. Keep those paths resolvable.
+    allow_remote_prefixes = (
+        "s3://bucket/cosmos_diffusion_v2/pretrain_weights/tokenizer/",
+        "s3://bucket/cosmos_reasoning1/",
+        "s3://bucket/cosmos_diffusion_v2/pretrain_weights/models_t5_",
+    )
     checkpoint_uri = checkpoint_uri.rstrip("/")
     if checkpoint_uri.startswith("s3://"):
+        if disable_remote and not checkpoint_uri.startswith(allow_remote_prefixes):
+            return checkpoint_uri
         return get_checkpoint_by_s3(checkpoint_uri).path
     if checkpoint_uri.startswith("hf://"):
+        if disable_remote and not any(p in checkpoint_uri for p in ("Cosmos-Reason1", "tokenizer")):
+            return checkpoint_uri
         return get_checkpoint_by_hf(checkpoint_uri)
     if not os.path.exists(checkpoint_uri):
         raise ValueError(f"Checkpoint path {checkpoint_uri} does not exist.")

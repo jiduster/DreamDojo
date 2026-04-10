@@ -12,14 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
 from cosmos_predict2._src.predict2.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 from cosmos_predict2._src.predict2.tokenizers.wan2pt2 import Wan2pt2VAEInterface
 
-Wan2pt1VAEConfig: LazyDict = L(Wan2pt1VAEInterface)(name="wan2pt1_tokenizer")
+_LOCAL_WAN2PT1_TOKENIZER_PATH = os.environ.get("COSMOS_LOCAL_WAN2PT1_TOKENIZER_PTH", "").strip()
+_DEFAULT_WAN2PT1_TOKENIZER_PATH = (
+    _LOCAL_WAN2PT1_TOKENIZER_PATH
+    if _LOCAL_WAN2PT1_TOKENIZER_PATH
+    else "s3://bucket/cosmos_diffusion_v2/pretrain_weights/tokenizer/wan2pt1/Wan2.1_VAE.pth"
+)
+
+Wan2pt1VAEConfig: LazyDict = L(Wan2pt1VAEInterface)(
+    name="wan2pt1_tokenizer",
+    vae_pth=_DEFAULT_WAN2PT1_TOKENIZER_PATH,
+)
 Wan2pt1VAEConfig_GCP: LazyDict = L(Wan2pt1VAEInterface)(
     name="wan2pt1_tokenizer_gcp",
     s3_credential_path="credentials/gcp_training.secret",

@@ -16,12 +16,13 @@
 # Configs for resuming from stage3 training
 
 import functools
+import os
+from pathlib import Path
 
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
-from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 from cosmos_predict2._src.predict2.datasets.cached_replay_dataloader import (
     duplicate_batches,
     duplicate_batches_random,
@@ -34,6 +35,37 @@ from cosmos_predict2._src.predict2.text_encoders.text_encoder import EmbeddingCo
 from cosmos_predict2.config import MODEL_CHECKPOINTS, ModelKey
 
 DEFAULT_CHECKPOINT = MODEL_CHECKPOINTS[ModelKey()]  # This uses post_trained=True by default
+_DEFAULT_REASON1_CKPT_PATH = os.environ.get(
+    "COSMOS_LOCAL_REASON1_CKPT_PATH",
+    "s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+).strip()
+
+
+def _resolve_local_or_remote_load_path() -> str:
+    """
+    Resolve default load_path without triggering remote download at import time.
+
+    Priority:
+    1) DREAMDOJO_ACTION_LOAD_PATH_2B env var
+    2) known local checkpoints
+    3) remote URI fallback
+    """
+    env_path = os.environ.get("DREAMDOJO_ACTION_LOAD_PATH_2B", "").strip()
+    if env_path:
+        return env_path
+
+    local_candidates = [
+        "/mnt/ceph/ckpt/2B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "checkpoints/DreamDojo/2B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "/mnt/ceph/ckpt/2B_pretrain/iter_000140000/model",
+        "checkpoints/DreamDojo/2B_pretrain/iter_000140000/model",
+    ]
+    for candidate in local_candidates:
+        if Path(candidate).exists():
+            return candidate
+
+    # Keep remote URI as a fallback; runtime loader can still resolve it.
+    return DEFAULT_CHECKPOINT.s3.uri
 
 _TRAINER_DEBUG_CONFIG = dict(
     max_iter=1000,
@@ -173,7 +205,7 @@ T2V_REASON_EMBEDDINGS_V1P1_STAGE_C_PT_4_INDEX_26_SIZE_2B_RES_720_FPS16_STANDALON
                 text_encoder_config=dict(
                     embedding_concat_strategy=str(EmbeddingConcatStrategy.FULL_CONCAT),
                     compute_online=True,
-                    ckpt_path="s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+                    ckpt_path=_DEFAULT_REASON1_CKPT_PATH,
                 ),
             )
         ),
@@ -343,7 +375,7 @@ T2V_REASON_EMBEDDINGS_V1P1_STAGE_C_PT_4_INDEX_26_SIZE_2B_RES_720_FPS16_RECTIFIED
                 text_encoder_config=dict(
                     embedding_concat_strategy=str(EmbeddingConcatStrategy.FULL_CONCAT),
                     compute_online=True,
-                    ckpt_path="s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+                    ckpt_path=_DEFAULT_REASON1_CKPT_PATH,
                 ),
             )
         ),
@@ -695,7 +727,7 @@ AC_CHUNK_MULTI_VIEW_2B_GR00T_GR1_CUSTOMIZED_13FRAME_FULL_16NODES = LazyDict(
 )
 
 default_experiment = DEFAULT_CHECKPOINT.experiment
-load_path = get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri)
+load_path = _resolve_local_or_remote_load_path()
 ac_reason_embeddings_rectified_flow_2b_oss = LazyDict(
     dict(
         defaults=[

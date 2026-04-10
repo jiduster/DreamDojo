@@ -13,17 +13,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict, LazyConfig
-from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 from cosmos_predict2.config import MODEL_CHECKPOINTS, ModelKey
 
 # Use the post-trained checkpoint which has the correct experiment reference
 DEFAULT_CHECKPOINT = MODEL_CHECKPOINTS[ModelKey(post_trained=False)]  # This uses post_trained=True by default
 DEFAULT_CHECKPOINT_14B = MODEL_CHECKPOINTS[ModelKey(post_trained=False, size="14B")]
+
+def _resolve_local_or_remote_load_path(
+    env_key: str,
+    local_candidates: list[str],
+    remote_uri: str,
+) -> str:
+    """
+    Resolve model load path without forcing remote download at import time.
+
+    Priority:
+    1) environment variable
+    2) first existing local candidate
+    3) remote URI (resolved later by runtime loader if needed)
+    """
+    env_path = os.environ.get(env_key, "").strip()
+    if env_path:
+        return env_path
+
+    for candidate in local_candidates:
+        if Path(candidate).exists():
+            return candidate
+
+    return remote_uri
+
+
+_DEFAULT_LOAD_PATH_2B = _resolve_local_or_remote_load_path(
+    env_key="DREAMDOJO_ACTION_LOAD_PATH_2B",
+    local_candidates=[
+        "/mnt/ceph/ckpt/2B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "checkpoints/DreamDojo/2B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "/mnt/ceph/ckpt/2B_pretrain/iter_000140000/model",
+        "checkpoints/DreamDojo/2B_pretrain/iter_000140000/model",
+    ],
+    remote_uri=DEFAULT_CHECKPOINT.s3.uri,
+)
+
+_DEFAULT_LOAD_PATH_14B = _resolve_local_or_remote_load_path(
+    env_key="DREAMDOJO_ACTION_LOAD_PATH_14B",
+    local_candidates=[
+        "/mnt/ceph/ckpt/14B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "checkpoints/DreamDojo/14B_pretrain/iter_000140000/model_ema_bf16.pt",
+        "/mnt/ceph/ckpt/14B_pretrain/iter_000140000/model",
+        "checkpoints/DreamDojo/14B_pretrain/iter_000140000/model",
+    ],
+    remote_uri=DEFAULT_CHECKPOINT_14B.s3.uri,
+)
 
 
 def load_experiment_config(experiment_name: str, default_config: LazyDict) -> LazyDict:
@@ -92,7 +138,7 @@ _default_groot_config = LazyDict(
         checkpoint=dict(
             save_iter=10_000,
             # pyrefly: ignore  # missing-attribute
-            load_path=get_checkpoint_path(DEFAULT_CHECKPOINT.s3.uri),
+            load_path=_DEFAULT_LOAD_PATH_2B,
             # load_path="/mnt/amlfs-01/shared/shenyuang/cosmos_logs/exp1201/pretrain/checkpoints/iter_000100000/",
             load_training_state=False,
             strict_resume=False,
@@ -203,7 +249,7 @@ _default_groot_config_14b = LazyDict(
         checkpoint=dict(
             save_iter=5_000,
             # pyrefly: ignore  # missing-attribute
-            load_path=get_checkpoint_path(DEFAULT_CHECKPOINT_14B.s3.uri),
+            load_path=_DEFAULT_LOAD_PATH_14B,
             # load_path="/mnt/amlfs-01/shared/shenyuang/cosmos_logs/exp1201/pretrain/checkpoints/iter_000100000/",
             load_training_state=False,
             strict_resume=False,

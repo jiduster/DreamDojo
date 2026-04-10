@@ -16,6 +16,7 @@
 # Configs for resuming from stage3 training
 
 import functools
+import os
 
 from hydra.core.config_store import ConfigStore
 
@@ -49,6 +50,10 @@ _CKPT_DEBUG_CONFIG = dict(
     load_training_state=False,
     strict_resume=False,
 )
+_DEFAULT_REASON1_CKPT_PATH = os.environ.get(
+    "COSMOS_LOCAL_REASON1_CKPT_PATH",
+    "s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+).strip()
 
 
 def build_debug_runs(job):
@@ -167,7 +172,7 @@ T2V_REASON_EMBEDDINGS_V1P1_STAGE_C_PT_4_INDEX_26_SIZE_2B_RES_720_FPS16_STANDALON
                 text_encoder_config=dict(
                     embedding_concat_strategy=str(EmbeddingConcatStrategy.FULL_CONCAT),
                     compute_online=True,
-                    ckpt_path="s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+                    ckpt_path=_DEFAULT_REASON1_CKPT_PATH,
                 ),
             )
         ),
@@ -335,7 +340,7 @@ T2V_REASON_EMBEDDINGS_V1P1_STAGE_C_PT_4_INDEX_26_SIZE_2B_RES_720_FPS16_RECTIFIED
                 text_encoder_config=dict(
                     embedding_concat_strategy=str(EmbeddingConcatStrategy.FULL_CONCAT),
                     compute_online=True,
-                    ckpt_path="s3://bucket/cosmos_reasoning1/sft_exp700/sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/checkpoints/iter_000016000/model/",
+                    ckpt_path=_DEFAULT_REASON1_CKPT_PATH,
                 ),
             )
         ),
