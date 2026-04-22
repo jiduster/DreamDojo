@@ -43,6 +43,22 @@ from cosmos_predict2.config import MODEL_CHECKPOINTS, VIDEO_EXTENSIONS
 
 from groot_dreams.dataloader import MultiVideoActionDataset
 
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
+
+
+def _ensure_mediapy_ffmpeg() -> None:
+    if mediapy.video_is_available():
+        return
+    if imageio_ffmpeg is None:
+        return
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    if ffmpeg_path and os.path.exists(ffmpeg_path):
+        mediapy.set_ffmpeg(ffmpeg_path)
+        logger.info(f"Using bundled ffmpeg from imageio_ffmpeg: {ffmpeg_path}")
+
 
 def _get_robot_states(label, state_key="state", gripper_key="continuous_gripper_state"):
     """
@@ -214,6 +230,7 @@ def inference(
 ):
     """Run action-conditioned video generation inference using resolved setup and per-run arguments."""
     torch.enable_grad(False)  # Disable gradient calculations for inference
+    _ensure_mediapy_ffmpeg()
 
     # Validate num_latent_conditional_frames at the very beginning
     if inference_args.num_latent_conditional_frames not in [0, 1, 2]:
@@ -252,6 +269,19 @@ def inference(
     if experiment is None:
         raise ValueError("Experiment name must be provided either in setup args or checkpoint metadata")
 
+    # Force local Reason1 checkpoint when provided, to avoid remote resolution
+    # (S3/HF) during inference initialization.
+    experiment_opts = []
+    local_reason1_ckpt = os.environ.get("COSMOS_LOCAL_REASON1_CKPT_PATH", "").strip()
+    if local_reason1_ckpt:
+        experiment_opts.extend(
+            [
+                f"model.config.text_encoder_config.ckpt_path={local_reason1_ckpt}",
+                "model.config.text_encoder_config.s3_credential_path=",
+            ]
+        )
+        logger.info(f"Using local Reason1 checkpoint: {local_reason1_ckpt}")
+
     # Initialize the inference handler with context parallel support
     video2world_cli = Video2WorldInference(
         experiment_name=experiment,
@@ -260,6 +290,7 @@ def inference(
         # pyrefly: ignore  # bad-argument-type
         context_parallel_size=setup_args.context_parallel_size,
         config_file=setup_args.config_file,
+        experiment_opts=experiment_opts,
     )
 
     mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -378,14 +409,27 @@ def inference(
         chunk_video_name = str(inference_args.save_root / f"{save_name}_pred.mp4")
 
         if rank0:
+            gt_video_np = gt_video.numpy()
+            if chunk_video.shape[0] != gt_video_np.shape[0]:
+                min_frames = min(chunk_video.shape[0], gt_video_np.shape[0])
+                logger.warning(
+                    f"Frame count mismatch for {save_name}: pred={chunk_video.shape[0]}, gt={gt_video_np.shape[0]}. "
+                    f"Using first {min_frames} frames for merged video and metrics."
+                )
+                pred_eval_video = chunk_video[:min_frames]
+                gt_eval_video = gt_video_np[:min_frames]
+            else:
+                pred_eval_video = chunk_video
+                gt_eval_video = gt_video_np
+
             mediapy.write_video(chunk_video_name, chunk_video, fps=inference_args.save_fps)
-            mediapy.write_video(str(inference_args.save_root / f"{save_name}_gt.mp4"), gt_video.numpy(), fps=inference_args.save_fps)
-            concat_video = np.concatenate([gt_video.numpy(), chunk_video], axis=2)
+            mediapy.write_video(str(inference_args.save_root / f"{save_name}_gt.mp4"), gt_video_np, fps=inference_args.save_fps)
+            concat_video = np.concatenate([gt_eval_video, pred_eval_video], axis=2)
             mediapy.write_video(str(inference_args.save_root / f"{save_name}_merged.mp4"), concat_video, fps=inference_args.save_fps)
             np.save(str(inference_args.save_root / f"{save_name}_actions.npy"), actions)
             logger.info(f"Saved video to {chunk_video_name}")
-            x_batch = torch.clamp(torch.from_numpy(chunk_video) / 255.0, 0, 1).permute(0, 3, 1, 2)
-            y_batch = torch.clamp(gt_video / 255.0, 0, 1).permute(0, 3, 1, 2)
+            x_batch = torch.clamp(torch.from_numpy(pred_eval_video) / 255.0, 0, 1).permute(0, 3, 1, 2)
+            y_batch = torch.clamp(torch.from_numpy(gt_eval_video) / 255.0, 0, 1).permute(0, 3, 1, 2)
             psnr = piq.psnr(x_batch, y_batch).mean().item()
             ssim = piq.ssim(x_batch, y_batch).mean().item()
             lpips = piq.LPIPS()(x_batch, y_batch).mean().item()

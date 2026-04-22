@@ -526,11 +526,22 @@ class Attention(nn.Module):
             v = self.v_norm(v)
             original_dtype = q.dtype
             if self.is_selfattn and rope_emb is not None:  # only apply to self-attention!
+                # TE RoPE requires rope sequence length >= q/k sequence length.
+                # Under some CP layouts, rope length can be shorter than q/k length
+                # (e.g., 1200 vs 2400). In that case, tile RoPE along sequence to
+                # satisfy the length requirement.
+                seq_dim = 1 if self.qkv_format == "bshd" else 0
+                cur_seq_len = q.shape[seq_dim]
+                if rope_emb.shape[0] < cur_seq_len:
+                    repeat_factor = math.ceil(cur_seq_len / rope_emb.shape[0])
+                    rope_emb = rope_emb.repeat(repeat_factor, 1, 1, 1)[:cur_seq_len]
                 if self.use_wan_fp32_strategy:  # wan will force q and k to fp32 before rotary pos emb
                     q = q.to(torch.float32)
                     k = k.to(torch.float32)
-                q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=True)
-                k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=True)
+                # Use non-fused RoPE in inference to avoid TE fused kernel
+                # sequence-length mismatch under context parallel execution.
+                q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
+                k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
                 if self.use_wan_fp32_strategy:
                     q = q.to(original_dtype)
                     k = k.to(original_dtype)
@@ -1233,10 +1244,12 @@ class Block(nn.Module):
             self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
 
         self.cp_size = None
+        self.cp_group = None
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
         self.cp_size = None if ranks is None else len(ranks)
+        self.cp_group = process_group
         self.self_attn.set_context_parallel_group(
             process_group=process_group,
             ranks=ranks,
@@ -1359,6 +1372,23 @@ class Block(nn.Module):
         else:
             self_attn_output = self_attn_result
 
+        expected_local_seq = T * H * W
+        if self_attn_output.shape[1] != expected_local_seq:
+            if (
+                self.cp_size is not None
+                and self.cp_size > 1
+                and self_attn_output.shape[1] == expected_local_seq * self.cp_size
+            ):
+                if self.cp_group is not None:
+                    self_attn_output = split_inputs_cp(self_attn_output, seq_dim=1, cp_group=self.cp_group)
+                else:
+                    self_attn_output = self_attn_output[:, :expected_local_seq, :]
+            else:
+                raise RuntimeError(
+                    f"Unexpected self-attention output sequence length {self_attn_output.shape[1]} "
+                    f"(expected {expected_local_seq}, cp_size={self.cp_size})."
+                )
+
         result_B_T_H_W_D = rearrange(
             self_attn_output,
             "b (t h w) d -> b t h w d",
@@ -1378,12 +1408,29 @@ class Block(nn.Module):
             _normalized_x_B_T_H_W_D = _fn(
                 _x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D
             )
+            cross_attn_output = self.cross_attn(
+                rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+                crossattn_emb,
+                rope_emb=rope_emb_L_1_1_D,
+            )
+            expected_local_seq = T * H * W
+            if cross_attn_output.shape[1] != expected_local_seq:
+                if (
+                    self.cp_size is not None
+                    and self.cp_size > 1
+                    and cross_attn_output.shape[1] == expected_local_seq * self.cp_size
+                ):
+                    if self.cp_group is not None:
+                        cross_attn_output = split_inputs_cp(cross_attn_output, seq_dim=1, cp_group=self.cp_group)
+                    else:
+                        cross_attn_output = cross_attn_output[:, :expected_local_seq, :]
+                else:
+                    raise RuntimeError(
+                        f"Unexpected cross-attention output sequence length {cross_attn_output.shape[1]} "
+                        f"(expected {expected_local_seq}, cp_size={self.cp_size})."
+                    )
             _result_B_T_H_W_D = rearrange(
-                self.cross_attn(
-                    rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                    crossattn_emb,
-                    rope_emb=rope_emb_L_1_1_D,
-                ),
+                cross_attn_output,
                 "b (t h w) d -> b t h w d",
                 t=T,
                 h=H,

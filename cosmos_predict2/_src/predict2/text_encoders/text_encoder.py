@@ -32,6 +32,10 @@ from cosmos_predict2._src.reason1.configs.default.model_config_qwen import QwenM
 from cosmos_predict2._src.reason1.tokenizer.processor import build_tokenizer
 
 NUM_EMBEDDING_PADDING_TOKENS = 512
+_DEFAULT_REASON1_MODEL_DIR = os.environ.get(
+    "COSMOS_LOCAL_REASON1_MODEL_DIR",
+    "Qwen/Qwen2.5-VL-7B-Instruct",
+).strip()
 
 
 @attrs.define(slots=False)
@@ -48,7 +52,7 @@ class TextEncoderConfig:
     model_config: QwenVLBaseModel = L(QwenVLBaseModel)(
         model_config=L(QwenModelConfig)(
             tokenizer_type="Qwen/Qwen2.5-VL-7B-Instruct",
-            name_or_path="Qwen/Qwen2.5-VL-7B-Instruct",
+            name_or_path=_DEFAULT_REASON1_MODEL_DIR,
             hidden_size=3584,
             intermediate_size=18944,
             max_window_layers=28,

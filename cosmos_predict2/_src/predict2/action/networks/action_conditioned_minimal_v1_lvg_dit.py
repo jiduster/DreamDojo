@@ -19,8 +19,10 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange
+from megatron.core import parallel_state
 
 from cosmos_predict2._src.imaginaire.utils import log
+from cosmos_predict2._src.imaginaire.utils.context_parallel import split_inputs_cp
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import MiniTrainDIT
 
@@ -42,6 +44,49 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+
+def _align_video_mask_with_latent_for_cp(
+    x_B_C_T_H_W: torch.Tensor, condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert condition_video_input_mask_B_C_T_H_W is not None, "condition_video_input_mask_B_C_T_H_W is required"
+
+    x_t = x_B_C_T_H_W.shape[2]
+    mask_t = condition_video_input_mask_B_C_T_H_W.shape[2]
+    if x_t == mask_t:
+        return x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W
+
+    cp_group = None
+    cp_size = 1
+    if parallel_state.is_initialized():
+        cp_group = parallel_state.get_context_parallel_group()
+        if cp_group is not None:
+            cp_size = cp_group.size()
+
+    # Handle global/local temporal mismatches introduced by CP.
+    if cp_group is not None and cp_size > 1:
+        if mask_t == x_t * cp_size:
+            condition_video_input_mask_B_C_T_H_W = split_inputs_cp(
+                condition_video_input_mask_B_C_T_H_W, seq_dim=2, cp_group=cp_group
+            )
+        elif x_t == mask_t * cp_size:
+            x_B_C_T_H_W = split_inputs_cp(x_B_C_T_H_W, seq_dim=2, cp_group=cp_group)
+
+    x_t = x_B_C_T_H_W.shape[2]
+    mask_t = condition_video_input_mask_B_C_T_H_W.shape[2]
+    if x_t != mask_t:
+        if mask_t == 1:
+            condition_video_input_mask_B_C_T_H_W = condition_video_input_mask_B_C_T_H_W.expand(
+                -1, -1, x_t, -1, -1
+            )
+        elif x_t == 1:
+            x_B_C_T_H_W = x_B_C_T_H_W.expand(-1, -1, mask_t, -1, -1)
+        else:
+            raise RuntimeError(
+                f"Cannot align latent/mask temporal dims under CP: x.T={x_t}, mask.T={mask_t}, cp_size={cp_size}"
+            )
+
+    return x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W
 
 
 class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
@@ -97,6 +142,9 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         del kwargs
 
         if data_type == DataType.VIDEO:
+            x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W = _align_video_mask_with_latent_for_cp(
+                x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W
+            )
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
         else:
             B, _, T, H, W = x_B_C_T_H_W.shape
@@ -249,6 +297,9 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
         del kwargs
 
         if data_type == DataType.VIDEO:
+            x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W = _align_video_mask_with_latent_for_cp(
+                x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W
+            )
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
         else:
             B, _, T, H, W = x_B_C_T_H_W.shape
